@@ -22,7 +22,7 @@ E5（Unisoc UMS9621）OpenWrt 固件的短信 / 彩信增强补丁，解决两�
 
 ```sh
 wget -q -O /tmp/e5-mms.sh --header='Accept: application/vnd.github.raw' \
-  https://api.github.com/repos/lixin2295368525-cmd/e5-mms-patch/contents/install.sh && sh /tmp/e5-mms.sh
+  https://api.github.com/repos/qingchangsheng123/e5-mms-patch/contents/install.sh && sh /tmp/e5-mms.sh
 ```
 
 脚本发现本地没有 `files/` 会自动下载发布包再安装。
