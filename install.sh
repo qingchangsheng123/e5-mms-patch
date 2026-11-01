@@ -7,11 +7,11 @@
 #
 # 在线安装（设备能访问 GitHub 时，raw.githubusercontent.com 在国内常被阻断，故走 api）：
 #   wget -q -O /tmp/e5-mms.sh --header='Accept: application/vnd.github.raw' \
-#     https://api.github.com/repos/lixin2295368525-cmd/e5-mms-patch/contents/install.sh
+#     https://api.github.com/repos/qingchangsheng123/e5-mms-patch/contents/install.sh
 #   sh /tmp/e5-mms.sh
 
 set -u
-REPO=lixin2295368525-cmd/e5-mms-patch
+REPO=qingchangsheng123/e5-mms-patch
 TARGET=/etc/e5/mms
 DST=/usr/lib/e5/sms_pdu.py
 FWD=/usr/libexec/unisoc-modem/sms-forward
