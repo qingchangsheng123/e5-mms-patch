@@ -1,11 +1,59 @@
 #!/bin/sh /etc/rc.common
 # 开机补装：系统升级会把 /usr/lib/e5/sms_pdu.py 换回原版，这里在短信服务启动前补回来
 # START=19 早于 e5-modemd(22)、unisoc-modem-ui(95)，也早于收短信的进程
+#
+# 每次执行都会把过程写进 /etc/e5/mms/boot.log（带时间戳），超过 64KB 自动截断保留后半。
+# 排查「升级后补丁到底补回来没有」时直接看这个文件，不必再临时插桩：
+#   cat /etc/e5/mms/boot.log
 
 START=19
+LOG=/etc/e5/mms/boot.log
+LOG_MAX=65536
+
+# 只匹配真正在跑的进程，[y] 写法避免匹配到自己这条命令行
+receiver_count() {
+	ps w 2>/dev/null | grep -c '[p]ython3 /usr/libexec/e5-sms-receive serve' 2>/dev/null || true
+}
+
+boot_log() {
+	[ -d /etc/e5/mms ] || return 0
+	if [ -f "$LOG" ]; then
+		_sz=$(wc -c < "$LOG" 2>/dev/null | awk '{ print $1 + 0 }')
+		if [ "${_sz:-0}" -gt "$LOG_MAX" ] 2>/dev/null; then
+			# 只留后半，避免无限增长；保留文件本身，权限不变
+			tail -c $((LOG_MAX / 2)) "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+		fi
+	fi
+	{ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; } >> "$LOG" 2>/dev/null
+	return 0
+}
 
 start() {
-	[ -x /etc/e5/mms/install.sh ] && sh /etc/e5/mms/install.sh >/dev/null 2>&1
+	if [ ! -x /etc/e5/mms/install.sh ]; then
+		boot_log "开机自愈跳过：缺少 /etc/e5/mms/install.sh"
+		return 0
+	fi
+
+	_before=$(receiver_count)
+	_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	boot_log "开机自愈开始 uptime=${_up:-?}s 收短信进程=${_before}"
+
+	_t0=$(date +%s)
+	_out=$(sh /etc/e5/mms/install.sh 2>&1)
+	_rc=$?
+	_t1=$(date +%s)
+	_after=$(receiver_count)
+
+	# 安装脚本的每行输出缩进记进日志：一眼看出这次是真补了文件还是本来就在
+	echo "$_out" | while IFS= read -r _line; do
+		[ -n "$_line" ] && boot_log "  $_line"
+	done
+
+	if [ "$_rc" -eq 0 ] 2>/dev/null; then
+		boot_log "开机自愈完成 rc=0 用时=$((_t1 - _t0))s 收短信进程=${_after}"
+	else
+		boot_log "开机自愈异常 rc=${_rc} 用时=$((_t1 - _t0))s 收短信进程=${_after}"
+	fi
 	return 0
 }
 
