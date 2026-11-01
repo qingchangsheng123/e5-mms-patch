@@ -68,7 +68,10 @@ else
 		die "下载失败。请手动下载 https://github.com/$REPO 后在其目录里执行 sh install.sh"
 	fi
 	tar -xzf "$TMP/pkg.tar.gz" -C "$TMP" 2>/dev/null || { rm -rf "$TMP"; die "解压失败"; }
-	SRCDIR=$(ls -d "$TMP"/e5-mms-patch-* 2>/dev/null | head -1)
+	# 顶层目录名随通道而变：codeload 是 <仓库>-main，api tarball 是 <owner>-<仓库>-<sha>，
+	# 所以按 files/sms_pdu.py 反推安装目录，别认目录名。
+	SRCDIR=$(ls -d "$TMP"/*/files/sms_pdu.py 2>/dev/null | head -1)
+	[ -n "$SRCDIR" ] && SRCDIR=${SRCDIR%/files/sms_pdu.py}
 	[ -n "$SRCDIR" ] && [ -f "$SRCDIR/files/sms_pdu.py" ] || { rm -rf "$TMP"; die "下载包结构不对"; }
 fi
 
