@@ -57,25 +57,31 @@ fi
 
 # 解码器只在进程启动时读入；换了文件要让收短信的进程重开
 if [ "$CHANGED" = "1" ]; then
-	for pid in $(receiver); do
-		kill -TERM "$pid" 2>/dev/null || true
-	done
-	# 有的固件会自己把进程拉回来：先等一会儿，别和它抢，否则会有两个实例
-	n=0
-	while [ "$n" -lt 8 ]; do
-		sleep 1
-		[ -n "$(receiver)" ] && break
-		n=$((n + 1))
-	done
 	if [ -z "$(receiver)" ]; then
-		# 确实没人管：按原来的方式重新拉起
-		setsid python3 /usr/libexec/e5-sms-receive serve </dev/null >/dev/null 2>&1 &
-		sleep 2
-	fi
-	if [ -n "$(receiver)" ]; then
-		echo "短信接收已用新解码器重开"
+		# 开机早期（S19）收短信进程还没起来：文件已就位，等系统服务正常拉起即可。
+		# 这里若主动 setsid 一个，会和随后 e5-sms-notify 拉起的那个并存，变成两个实例。
+		echo "短信接收尚未启动（开机早期），文件已就位，交给系统服务拉起"
 	else
-		echo "警告：短信接收没有起来，执行 /usr/libexec/e5-sms-receive serve 检查"
+		for pid in $(receiver); do
+			kill -TERM "$pid" 2>/dev/null || true
+		done
+		# 有的固件会自己把进程拉回来：先等一会儿，别和它抢，否则会有两个实例
+		n=0
+		while [ "$n" -lt 8 ]; do
+			sleep 1
+			[ -n "$(receiver)" ] && break
+			n=$((n + 1))
+		done
+		if [ -z "$(receiver)" ]; then
+			# 确实没人管：按原来的方式重新拉起
+			setsid python3 /usr/libexec/e5-sms-receive serve </dev/null >/dev/null 2>&1 &
+			sleep 2
+		fi
+		if [ -n "$(receiver)" ]; then
+			echo "短信接收已用新解码器重开"
+		else
+			echo "警告：短信接收没有起来，执行 /usr/libexec/e5-sms-receive serve 检查"
+		fi
 	fi
 fi
 
