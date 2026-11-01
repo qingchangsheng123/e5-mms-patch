@@ -5,8 +5,9 @@
 #   sh install.sh --backfill   装完后把收件箱里历史乱码彩信改正
 #   sh install.sh --dry-run    只检查环境，不改任何东西
 #
-# 在线安装（手上没有仓库时）：
-#   wget -O /tmp/e5-mms.sh https://raw.githubusercontent.com/lixin2295368525-cmd/e5-mms-patch/main/install.sh
+# 在线安装（设备能访问 GitHub 时，raw.githubusercontent.com 在国内常被阻断，故走 api）：
+#   wget -q -O /tmp/e5-mms.sh --header='Accept: application/vnd.github.raw' \
+#     https://api.github.com/repos/lixin2295368525-cmd/e5-mms-patch/contents/install.sh
 #   sh /tmp/e5-mms.sh
 
 set -u
@@ -54,12 +55,19 @@ else
 	say "本地没有 files/ 目录，从 GitHub 拉取发布包…"
 	TMP=/tmp/e5-mms-$$
 	mkdir -p "$TMP" || die "无法创建临时目录"
-	wget -q -O "$TMP/pkg.tar.gz" "https://codeload.github.com/$REPO/tar.gz/refs/heads/main" </dev/null
+	# 两条通道依次尝试：codeload 直连；失败再走 api.github.com 的 tarball（会 302 回 codeload）
+	for u in "https://codeload.github.com/$REPO/tar.gz/refs/heads/main" \
+	         "https://api.github.com/repos/$REPO/tarball/main"; do
+		rm -f "$TMP/pkg.tar.gz"
+		wget -q -O "$TMP/pkg.tar.gz" "$u" </dev/null 2>/dev/null
+		[ -s "$TMP/pkg.tar.gz" ] && break
+		say "  该通道不稳定，换一个…"
+	done
 	if [ ! -s "$TMP/pkg.tar.gz" ]; then
 		rm -rf "$TMP"
 		die "下载失败。请手动下载 https://github.com/$REPO 后在其目录里执行 sh install.sh"
 	fi
-	tar -xzf "$TMP/pkg.tar.gz" -C "$TMP" || { rm -rf "$TMP"; die "解压失败"; }
+	tar -xzf "$TMP/pkg.tar.gz" -C "$TMP" 2>/dev/null || { rm -rf "$TMP"; die "解压失败"; }
 	SRCDIR=$(ls -d "$TMP"/e5-mms-patch-* 2>/dev/null | head -1)
 	[ -n "$SRCDIR" ] && [ -f "$SRCDIR/files/sms_pdu.py" ] || { rm -rf "$TMP"; die "下载包结构不对"; }
 fi
