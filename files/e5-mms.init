@@ -49,10 +49,13 @@ start() {
 		[ -n "$_line" ] && boot_log "  $_line"
 	done
 
-	if [ "$_rc" -eq 0 ] 2>/dev/null; then
-		boot_log "开机自愈完成 rc=0 用时=$((_t1 - _t0))s 收短信进程=${_after}"
-	else
+	if [ "$_rc" -ne 0 ] 2>/dev/null; then
 		boot_log "开机自愈异常 rc=${_rc} 用时=$((_t1 - _t0))s 收短信进程=${_after}"
+	elif [ "$_after" = "0" ]; then
+		# S19 在短信服务之前，这时进程本来就该是 0，不算异常
+		boot_log "开机自愈完成 rc=0 用时=$((_t1 - _t0))s 收短信进程=0（开机早期，交给系统服务拉起）"
+	else
+		boot_log "开机自愈完成 rc=0 用时=$((_t1 - _t0))s 收短信进程=${_after}"
 	fi
 	return 0
 }
