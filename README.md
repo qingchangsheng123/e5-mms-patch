@@ -56,6 +56,21 @@ files/e5-mms.init       ->  /etc/init.d/e5-mms            （开机自愈，STAR
 
 **为什么需要开机自愈**：系统升级会重新覆盖 `/usr` 下的文件，而 `/etc/e5` 会保留。`/etc/init.d/e5-mms`（START=19）每次开机早于短信服务执行一次安装，升级后自动补回来，不用手动重装。
 
+每次自愈的执行过程都会写进 `/etc/e5/mms/boot.log`（超过 64KB 自动截断保留后半），想看"这次开机到底补了什么"直接读它：
+
+```sh
+cat /etc/e5/mms/boot.log
+```
+
+```
+[2026-11-01 22:23:06] 开机自愈开始 uptime=6s 收短信进程=0
+[2026-11-01 22:23:06]   彩信解码已安装（MMS WAP Push）
+[2026-11-01 22:23:07]   短信转发补丁已是最新
+[2026-11-01 22:23:07] 开机自愈完成 rc=0 用时=1s 收短信进程=1
+```
+
+开局 `收短信进程=0` 是正常的（S19 早于短信服务启动），完成行的进程数应为 `1`。手动执行 `/etc/init.d/e5-mms start` 也会追加一段记录。
+
 ### 可选：回填历史乱码
 
 装完之后，收件箱里**已经存成乱码**的彩信通知不会自动变好，需要回填一次：
@@ -81,6 +96,9 @@ grep -c 'e5-forward-queue-v1' /usr/libexec/unisoc-modem/sms-forward
 # 队列状态 / 投递记录
 e5-forward status
 cat /etc/unisoc-modem/forward/delivery.log
+
+# 开机自愈每次执行干了什么（含开机秒数、执行前后收短信进程数）
+cat /etc/e5/mms/boot.log
 ```
 
 再收到一条彩信通知时，正文应该是：
