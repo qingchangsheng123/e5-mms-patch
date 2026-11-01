@@ -16,22 +16,26 @@ E5（Unisoc UMS9621）OpenWrt 固件的短信 / 彩信增强补丁，解决两�
 
 ## 安装
 
-### 方式一：离线（推荐）
+### 方式一：在线一条命令（推荐）
 
-把整个仓库拷到设备（或直接在设备上 `git clone`），然后：
+设备能连外网时，直接执行：
+
+```sh
+wget -q -O /tmp/e5-mms.sh --header='Accept: application/vnd.github.raw' \
+  https://api.github.com/repos/lixin2295368525-cmd/e5-mms-patch/contents/install.sh && sh /tmp/e5-mms.sh
+```
+
+脚本发现本地没有 `files/` 会自动下载发布包再安装。
+
+> 为什么不用 `raw.githubusercontent.com`：这个域名在国内网络下经常被重置（实测 `Connection reset by peer`），而 `api.github.com` 和 `codeload.github.com` 通常可用。两者都失败时才需要用方式二。
+
+### 方式二：离线
+
+把整个仓库拷到设备（或下载 zip / tar.gz 解压后传进去），在解压出的目录里：
 
 ```sh
 sh install.sh
 ```
-
-### 方式二：在线一条命令
-
-```sh
-wget -O /tmp/e5-mms.sh https://raw.githubusercontent.com/lixin2295368525-cmd/e5-mms-patch/main/install.sh
-sh /tmp/e5-mms.sh
-```
-
-设备侧访问 GitHub 不通时，用方式一。
 
 ### 安装时发生了什么
 
