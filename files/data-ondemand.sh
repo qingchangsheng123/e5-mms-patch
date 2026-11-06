@@ -73,7 +73,7 @@ do_once() {
 run_loop() {
 	log "守护启动 idle=${IDLE_SECS}s check=${CHECK}s"
 	backoff_until=0
-	active=$(date +%s)
+	up_since=0
 	while :; do
 		now=$(date +%s)
 		pend=$(qlen)
@@ -81,15 +81,25 @@ run_loop() {
 			if [ "$now" -ge "$backoff_until" ]; then
 				if dial; then
 					/usr/libexec/unisoc-modem/sms-forward queue-retry >/dev/null 2>&1
-					active=$(date +%s)
+					up_since=$now
 				else
 					backoff_until=$((now + FAIL_BACKOFF))
 				fi
 			fi
 		else
-			if is_up && [ $((now - active)) -gt "$IDLE_SECS" ]; then
-				hangup
-				active=$(date +%s)
+			# 计时从"看到它 up"那一刻开始，而不是从上次活动。
+			# 否则手动 up（或开机时 netifd 自动 up）会因为计时基准太老而被立刻挂断。
+			if is_up; then
+				[ "$up_since" -eq 0 ] && up_since=$now
+				# 手动 up 会留下 hold 标记：一直保持，直到手动 down 或重启
+				if [ -f /tmp/.e5-do.hold ]; then
+					up_since=$now
+				elif [ $((now - up_since)) -gt "$IDLE_SECS" ]; then
+					hangup
+					up_since=0
+				fi
+			else
+				up_since=0
 			fi
 		fi
 		sleep "$CHECK"
@@ -99,12 +109,13 @@ run_loop() {
 case "$1" in
 run) run_loop ;;
 once) do_once; echo "rc=$?" ;;
-up) dial ;;
-down) IDLE_SECS=0 hangup ;;
+up) touch /tmp/.e5-do.hold; dial ;;
+down) rm -f /tmp/.e5-do.hold; IDLE_SECS=0 hangup ;;
 status)
 	echo -n "数据连接: "
 	if is_up; then echo "已连接（持续耗电）"; else echo "已断开（省电）"; fi
 	echo "待发队列: $(qlen) 条"
+	if [ -f /tmp/.e5-do.hold ]; then echo "手动保持: 是（不会自动挂断，用 down 取消）"; fi
 	echo -n "守护进程: "
 	if ps w | grep -q '[d]ata-ondemand.sh run'; then echo 运行中; else echo 未运行; fi
 	;;
