@@ -29,6 +29,7 @@
 - 队列空后再保持 90 秒才挂断，连到多条短信只拨一次
 - 拨号失败退避 90 秒，避免弱信号下反复拨号耗电
 - 日志：`/etc/e5/power/data-ondemand.log`
+- 手动拨号后不会被自动挂断：`up` 会留一个保持标记，直到 `down` 或重启
 - 手动控制：`/etc/e5/power/data-ondemand.sh {status|up|down|once}`
 
 ### 新增：开机应用省电配置
