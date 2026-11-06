@@ -12,7 +12,7 @@ E5（Unisoc UMS9621）OpenWrt 固件的短信 / 彩信增强补丁，解决两�
 - E5 类设备（Unisoc UMS9621 基带）+ 基于 `e5-sleep` 系列的 OpenWrt 固件
 - 需要存在 `/usr/lib/e5/sms_pdu.py`（短信 PDU 解码器）
 - 需要 `python3`（固件自带）
-- 固件版本参考：`6.18.54-e5-sleep14`，理论兼容其它 e5-sleep 版本
+- 固件版本参考：`6.18.54-e5-sleep14` / `6.18.54-e5-sleep16`，理论兼容其它 e5-sleep 版本
 
 ## 安装
 
@@ -117,6 +117,43 @@ sh uninstall.sh
 ```
 
 会还原两个原始文件、停用 `e5-mms` 开机服务、重开短信接收进程。`/etc/e5/mms` 下的备份和待重发队列不会删，确认无误后可手动 `rm -rf /etc/e5/mms`。
+
+省电扩展独立，单独回滚：
+
+```sh
+/etc/init.d/e5-data-ondemand stop && /etc/init.d/e5-data-ondemand disable
+/etc/init.d/e5-powersave stop && /etc/init.d/e5-powersave disable
+/etc/e5/power/powersave.sh off     # 恢复热点与蓝牙音频
+```
+
+## 省电：按需蜂窝数据
+
+`sleep16` 上有个容易忽略的耗电点：**只要数据连接（PDP）保持激活，基带每约 26 秒会唤醒一次
+SIPA 数据加速器，每次活约 10 秒、功耗 900mW**。实测这台设备：
+
+| 状态 | 功耗 |
+|---|---|
+| 数据常连 | 600-900mW 波动 |
+| 数据断开 | **317-325mW**（±30mW） |
+
+而拨号只要 6 秒，短信走信令通道、与数据连接无关。所以默认改成"平时断开、要推送才拨号"：
+
+```sh
+/etc/e5/power/data-ondemand.sh status   # 数据连接 / 待发队列 / 守护进程
+/etc/e5/power/data-ondemand.sh up       # 手动拨号
+/etc/e5/power/data-ondemand.sh down     # 手动断开
+```
+
+- 短信到达 → 投递失败入队 → 守护 5 秒内发现 → 拨号 6 秒 → 补发，整体延迟约 **15-20 秒**
+- 队列空后保持 90 秒才挂断，多条连发只拨一次
+- 拨号失败退避 90 秒
+- 日志：`/etc/e5/power/data-ondemand.log`
+
+不想牺牲推送实时性可以常连：
+
+```sh
+/etc/init.d/e5-data-ondemand disable    # 不再自动挂断
+```
 
 ## 两个问题的根因
 

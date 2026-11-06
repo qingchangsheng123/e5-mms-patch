@@ -92,7 +92,7 @@ if [ "$FWD_CHANGED" = "1" ]; then
 fi
 
 # ---------- 3. 本机额外扩展（装了才生效，与本补丁无关）----------
-for ext in /etc/e5/usb-rndis /etc/e5/maintenance; do
+for ext in /etc/e5/usb-rndis /etc/e5/maintenance /etc/e5/power; do
 	[ -x "$ext/install.sh" ] || continue
 	if sh "$ext/install.sh" >/dev/null 2>&1; then
 		echo "扩展 $(basename "$ext") 已就位"
