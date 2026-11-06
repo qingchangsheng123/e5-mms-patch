@@ -18,13 +18,24 @@ QUEUE=$BASE/queue
 IFACE=sipa_eth0
 LOG=/etc/e5/power/data-ondemand.log
 IDLE_SECS=${IDLE_SECS:-90}   # 队列空后再保持多久才挂断（秒）
-CHECK=${CHECK:-5}            # 轮询间隔
+CHECK=${CHECK:-3}            # 轮询间隔（越小越灵敏，2-3s 合适）
 DIAL_TRIES=15                # 拨号最多等几秒
 FAIL_BACKOFF=90              # 拨号失败后的退避（秒）
+DIALED=0                     # 本轮是否真的拨了号（用于强制补发）
 
 is_up() { [ "$(cat /sys/class/net/$IFACE/operstate 2>/dev/null)" = up ]; }
 
 qlen() { ls -A "$QUEUE" 2>/dev/null | wc -l | tr -d ' '; }
+
+# 队列里最早一条排了多久。短信本身在断网时进队，那段时间的退避没有意义，
+# 记下来是为了事后能算清"从短信进队到真正发出"到底花了多少秒。
+q_age() {
+	_f=$(ls -1t "$QUEUE"/* 2>/dev/null | tail -1)
+	[ -n "$_f" ] || { echo 0; return 0; }
+	_m=$(stat -c %Y "$_f" 2>/dev/null) || { echo 0; return 0; }
+	case "$_m" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+	echo $(( $(date +%s) - _m ))
+}
 
 log() {
 	# 256KB 轮转
@@ -36,7 +47,8 @@ log() {
 
 dial() {
 	is_up && return 0
-	log "拨号（队列 $(qlen) 条待发）"
+	log "拨号（队列 $(qlen) 条待发，最早一条 $(q_age)s 前入队）"
+	DIALED=1
 	ifup wan >/dev/null 2>&1
 	i=0
 	while [ "$i" -lt "$DIAL_TRIES" ]; do
@@ -45,7 +57,20 @@ dial() {
 		i=$((i + 1))
 	done
 	log "拨号失败（等 ${DIAL_TRIES}s 仍未 up）"
+	DIALED=0
 	return 1
+}
+
+# 补发。刚拨通的那一次强制跳过退避：队列里的 next 是在断网时定的，
+# 现在网络已经可用，再等 30s 纯属白等（实测占端到端延迟的一半以上）。
+retry_queue() {
+	if [ "$DIALED" = "1" ]; then
+		MU300_FORCE_RETRY=1 /usr/libexec/unisoc-modem/sms-forward queue-retry >/dev/null 2>&1
+		log "已强制补发（跳过退避），队列剩 $(qlen) 条"
+	else
+		/usr/libexec/unisoc-modem/sms-forward queue-retry >/dev/null 2>&1
+	fi
+	DIALED=0
 }
 
 hangup() {
@@ -60,7 +85,7 @@ do_once() {
 	pend=$(qlen)
 	if [ "$pend" -gt 0 ]; then
 		if dial; then
-			/usr/libexec/unisoc-modem/sms-forward queue-retry >/dev/null 2>&1
+			retry_queue
 			log "补发触发完成，队列剩 $(qlen) 条"
 			return 0
 		fi
@@ -80,7 +105,7 @@ run_loop() {
 		if [ "$pend" -gt 0 ]; then
 			if [ "$now" -ge "$backoff_until" ]; then
 				if dial; then
-					/usr/libexec/unisoc-modem/sms-forward queue-retry >/dev/null 2>&1
+					retry_queue
 					up_since=$now
 				else
 					backoff_until=$((now + FAIL_BACKOFF))
@@ -109,7 +134,7 @@ run_loop() {
 case "$1" in
 run) run_loop ;;
 once) do_once; echo "rc=$?" ;;
-up) touch /tmp/.e5-do.hold; dial ;;
+up) touch /tmp/.e5-do.hold; if dial; then retry_queue; fi ;;
 down) rm -f /tmp/.e5-do.hold; IDLE_SECS=0 hangup ;;
 status)
 	echo -n "数据连接: "
