@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# e5-data-ondemand —— 按需蜂窝数据（平时断开，有短信待推送才拨号）
+# START=97: 在 network(20)/modemmanager(70) 之后
+START=97
+STOP=12
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /bin/sh /etc/e5/power/data-ondemand.sh run
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# 停止时把数据恢复成连接，避免留下"无数据"状态让人困惑
+	/bin/sh /etc/e5/power/data-ondemand.sh up >/dev/null 2>&1
+}

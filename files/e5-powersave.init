@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# e5-powersave —— 开机应用省电配置（关热点、停蓝牙/音频/HFP）
+# START=98: 在 e5-mms(19) 自愈之后，确保扩展文件已就位
+START=98
+STOP=10
+USE_PROCD=0
+
+start() {
+	[ -x /etc/e5/power/powersave.sh ] || return 0
+	/etc/e5/power/powersave.sh on >/dev/null 2>&1
+	logger -t e5-powersave "省电配置已应用"
+}
+
+stop() {
+	[ -x /etc/e5/power/powersave.sh ] || return 0
+	/etc/e5/power/powersave.sh off >/dev/null 2>&1
+}

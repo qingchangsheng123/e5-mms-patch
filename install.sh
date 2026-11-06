@@ -84,6 +84,18 @@ cp "$SRCDIR/files/install-core.sh" "$TARGET/install.sh" && chmod 755 "$TARGET/in
 cp "$SRCDIR/files/e5-mms.init" /etc/init.d/e5-mms && chmod 755 /etc/init.d/e5-mms
 say "文件已放到 $TARGET"
 
+# ---------- 省电扩展（按需蜂窝数据 + 开机省电）----------
+if [ -f "$SRCDIR/files/powersave.sh" ] && [ -f "$SRCDIR/files/data-ondemand.sh" ]; then
+	mkdir -p /etc/e5/power || true
+	cp "$SRCDIR/files/powersave.sh" /etc/e5/power/powersave.sh && chmod 755 /etc/e5/power/powersave.sh
+	cp "$SRCDIR/files/data-ondemand.sh" /etc/e5/power/data-ondemand.sh && chmod 755 /etc/e5/power/data-ondemand.sh
+	cp "$SRCDIR/files/e5-data-ondemand.init" /etc/e5/power/e5-data-ondemand.init && chmod 755 /etc/e5/power/e5-data-ondemand.init
+	cp "$SRCDIR/files/e5-powersave.init" /etc/e5/power/e5-powersave.init && chmod 755 /etc/e5/power/e5-powersave.init
+	cp "$SRCDIR/files/power-install.sh" /etc/e5/power/install.sh && chmod 755 /etc/e5/power/install.sh
+	sh /etc/e5/power/install.sh >/dev/null 2>&1 || true
+	say "省电扩展已就位（按需拨号、开机省电）"
+fi
+
 # 开机自愈：系统升级会覆盖 /usr 下的东西，靠这个 S19 服务补回来
 /etc/init.d/e5-mms enable >/dev/null 2>&1
 say "开机自愈服务 e5-mms 已启用（START=19）"
