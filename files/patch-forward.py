@@ -19,9 +19,9 @@ import sys
 
 TARGET = os.environ.get('E5_FORWARD_TARGET', '/usr/libexec/unisoc-modem/sms-forward')
 BACKUP = os.environ.get('E5_FORWARD_BACKUP', '/etc/e5/mms/sms-forward.orig')
-MARK = '# e5-forward-queue-v1'
+MARK = '# e5-forward-queue-v2'
 
-BLOCK = r'''# e5-forward-queue-v1: 投递失败进入队列，按退避重试（由 /etc/e5/mms 注入）
+BLOCK = r'''# e5-forward-queue-v2: 投递失败进入队列，按退避重试（由 /etc/e5/mms 注入）
 QUEUE=$BASE/queue
 DELIVERY_LOG=$BASE/delivery.log
 RETRY_LIMIT=${MU300_FORWARD_RETRY_LIMIT:-7}
@@ -72,7 +72,11 @@ drain_queue() { # 每轮只补一条，避免长时间占着 state.lock 挡住�
         json_get_vars kind from text time profile card attempts next
         number "$attempts" || attempts=0
         number "$next" || next=0
-        [ "$_qnow" -ge "$next" ] || continue
+        # 数据从断开到拨上来这段时间，退避计时毫无意义：网络刚可用就补发。
+        # MU300_FORCE_RETRY=1 由按需拨号守护在刚拨通时传进来，只跳过一次等待。
+        if [ "$_qnow" -lt "$next" ] && [ "${MU300_FORCE_RETRY:-0}" != 1 ]; then
+            continue
+        fi
         _qslot=$card
         read_mode && select_profile "${profile:-shared}" || { rm -f "$_qfile"; continue; }
         [ "$_qslot" = 1 ] && STATE=$BASE/state.sim1
@@ -181,10 +185,23 @@ def main():
     if not os.path.exists(TARGET):
         fail('找不到 %s' % TARGET)
     with open(TARGET, encoding='utf-8', newline='') as stream:
-        text = stream.read()
-    if MARK in text:
+        original = stream.read()
+    if MARK in original:
         print('already')
         return 0
+    text = original
+    if 'e5-forward-queue-' in original:
+        # 从旧版补丁升级：旧补丁的代码已在文件里，锚点必然对不上。
+        # 用留着的上游原件重新打一遍，绝不在旧补丁上面叠。
+        clean = ''
+        if os.path.exists(BACKUP):
+            with open(BACKUP, encoding='utf-8', newline='') as stream:
+                clean = stream.read()
+        if 'e5-forward-queue-' in clean:
+            fail('旧补丁的原件备份已被覆盖，请从固件重新解出 sms-forward 再装')
+        if not clean:
+            fail('目标里已有旧补丁但没有原件备份 %s，请先还原原件' % BACKUP)
+        text = clean
     for name, anchor in [('process_event', EVENT_BEFORE),
                          ('run_daemon', DAEMON_BEFORE),
                          ('cli', CLI_BEFORE)]:
@@ -198,9 +215,11 @@ def main():
         fail('process_event 定义不唯一，未改动任何文件')
     patched = patched.replace(head, BLOCK + head, 1)
 
-    # 每次打补丁都刷新备份：系统升级后脚本会变，回滚要回到当前这版
-    shutil.copy2(TARGET, BACKUP)
-    os.chmod(BACKUP, 0o755)
+    # 只在原件干净时刷新备份：系统升级后脚本会变，回滚要回到当前这版。
+    # 若本次是从旧补丁升级，目标文件已被改过，不能拿它覆盖原件备份。
+    if 'e5-forward-queue-' not in original:
+        shutil.copy2(TARGET, BACKUP)
+        os.chmod(BACKUP, 0o755)
     temporary = TARGET + '.new'
     with open(temporary, 'w', encoding='utf-8', newline='') as stream:
         stream.write(patched)
