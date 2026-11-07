@@ -3,6 +3,31 @@
 最终版本，从一台实机（E5 / UMS9621 / `6.18.54-e5-sleep16`）的部署中逐步修正而来。
 早期迭代号（1.0.0 / 1.0.1 / 1.0.2）已从仓库撤销，其修复内容都并入本版本，不再单独发布。
 
+## 1.0.6 — 2026-11-07
+
+### 新增：OpenWrt 与 Android 双系统短信互通
+
+E5 的 OpenWrt 与 Android 是两套**互斥**的系统（`e5-next-boot` 决定启动哪一个），共用同一块
+userdata。短信本来各存一份：OpenWrt 在 `/etc/e5-sms/inbox.json`，Android 在 TelephonyProvider
+的 `mmssms.db`。切到另一边就看不到另一边的短信。
+
+新增 `e5-sms-sync`：
+
+- **双向**：Android 的新短信 → inbox（标 `source=android`，**不触发转发**）；inbox 里未同步的
+  → `mmssms.db`（标 `creator=e5-sync`）。
+- **指纹去重 + 来源标记**，两个方向不会互相回环。实测第二次运行 0/0。
+- 只在 Android 未运行时写库；写前把 `/mnt/e5-data` 临时 `remount,rw`，写完恢复 `ro`。
+- 每次真正写入前备份 `mmssms.db` 到 `/etc/e5/sms-sync/backup/`（保留 3 份）。
+- 开机跑一次（S99），之后 cron 每 2 分钟增量；日志 `/etc/e5/sms-sync/sync.log`。
+
+实测：73 条历史短信一次性写入 Android，17 个会话、时间与未读状态正确、无空正文、无孤儿会话；
+反向插入一条测试短信后，OpenWrt 收件箱立即出现且不回写数据库。
+
+### 变更：自愈扩展列表
+
+`files/install-core.sh` 的扩展目录从 3 个增至 4 个（新增 `/etc/e5/sms-sync`），
+升级后开机会自动重装同步服务、cron 与开机链接。
+
 ## 1.0.5 — 2026-11-06
 
 ### 修：按需拨号下首条推送延迟 31 秒

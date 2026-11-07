@@ -160,6 +160,32 @@ SIPA 数据加速器，每次活约 10 秒、功耗 900mW**。实测这台设备
 /etc/init.d/e5-data-ondemand disable    # 不再自动挂断
 ```
 
+## 双系统：OpenWrt 与 Android 短信互通
+
+E5 的 Android 与 OpenWrt 不会同时运行（`e5-next-boot` 决定启动哪一个），但共用同一块
+userdata，短信本来各存一份：OpenWrt 在 `/etc/e5-sms/inbox.json`，Android 在 TelephonyProvider
+的 `mmssms.db`。`e5-sms-sync` 让两边互相可见。
+
+```sh
+e5-sms-sync status                     # 两侧条数、已同步数、挂载状态、上次运行
+e5-sms-sync run                        # 立即同步一次
+e5-sms-sync run --dry-run --verbose    # 只看差异，不动数据
+```
+
+| 方向 | 写入位置 | 标记 | 是否触发转发 |
+|---|---|---|---|
+| OpenWrt → Android | `sms` 表 | `creator='e5-sync'` | — |
+| Android → OpenWrt | `inbox.json` | `source='android'`、`identity='android'` | **不转发** |
+
+- 只在 Android 未运行时写数据库；写前把 `/mnt/e5-data` 临时改成 rw，写完恢复 ro
+- 每次真正写入前备份 `mmssms.db` 到 `/etc/e5/sms-sync/backup/`（保留 3 份）
+- 开机跑一次，之后 cron 每 2 分钟增量；日志 `/etc/e5/sms-sync/sync.log`
+- 升级固件后无需手动恢复：`/etc/e5/sms-sync` 已加入 `e5-mms` 的开机自愈扩展列表
+- 卸载：`sh /etc/e5/sms-sync/uninstall.sh`（已写入 Android 的短信需在 Android 侧自行删除）
+
+已知限制：Android 侧的全文搜索索引（`words` 表）不会为同步进来的短信补建；中文本来也不分词，
+列表与会话查看不受影响。
+
 ## 两个问题的根因
 
 ### 1. 彩信通知乱码
