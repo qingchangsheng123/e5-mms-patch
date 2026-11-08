@@ -39,6 +39,7 @@ RTC_IDLE = int(os.environ.get("ED_RTC", "600"))        # 正常兜底
 RTC_BUSY = int(os.environ.get("ED_RTC_BUSY", "30"))    # 队列有活时的短兜底
 GAP = float(os.environ.get("ED_GAP", "0.5"))           # 入睡前的静默等待
 IDLE_GATED = float(os.environ.get("ED_IDLE", "5"))     # 门禁不通过时的轮询
+USB_SETTLE = float(os.environ.get("ED_USB_SETTLE", "6"))  # USB 拔出后需连续为 0 的秒数，避免拔插抖动误入挂起
 DRYRUN = os.environ.get("ED_DRYRUN", "0") == "1"
 FORCE_USB = os.environ.get("ED_FORCE_USB", "0") == "1"   # 测试用：忽略 usb-online 门禁
 SYNC_OFF = os.environ.get("ED_SYNC_OFF", "1") == "1"     # 关掉 sync_on_suspend
@@ -48,6 +49,7 @@ SUMMARY_EVERY = float(os.environ.get("ED_SUMMARY", "300"))
 DUR = float(os.environ.get("ED_DUR", "0"))             # >0 时到点自动退出（仅测试用）
 
 STOP = False
+_usb0_since = [None]   # USB 首次读到 0 的 BOOTTIME；用列表避免 global 声明
 
 
 def _on_sig(signum, frame):
@@ -167,7 +169,19 @@ def gate():
         return False, "off-flag"
     u = rd(USB_ON, "?")
     if u != "0" and not FORCE_USB:
+        _usb0_since[0] = None
         return False, "usb-online=%s" % u
+    if u == "0" and not FORCE_USB:
+        # 物理拔插时 usb/online 会短暂变 0。若立刻写 mem，插线回来时
+        # musb-sprd 处于 device 模式会 EBUSY，USB gadget 状态错乱，
+        # 主机侧表现为 RNDIS 网卡/IPv4 栈与串口半枚举。要求连续静默。
+        now = bt()
+        if _usb0_since[0] is None:
+            _usb0_since[0] = now
+        if now - _usb0_since[0] < USB_SETTLE:
+            return False, "usb-settle"
+    else:
+        _usb0_since[0] = None
     b = rd(BL, "?")
     if b not in ("0", ""):
         return False, "screen-on=%s" % b

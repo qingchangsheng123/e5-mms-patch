@@ -17,6 +17,17 @@ CP 消息（`smsg`）提前唤醒后正常完成短信接收与转发，然后�
   后者会让 wcn 驱动半死、挂起 EBUSY）。手动开关 `powersave.sh wlan-on|wlan-off`。
 - 90 分钟实机窗口：107 轮 / 占空比 94.42% / 挂起失败 0，唤醒源 100% `pscp-5:smsg-5-6`。
 
+### 修订：USB 拔出稳定期（当日 22:53）
+
+开机自愈实测通过（S19 铺回源件、S99 拉起、守护 running+enabled）。同时抓到一个真实故障：
+**拔插 USB 的瞬间** `usb/online` 会短暂读到 0，守护立刻 armed 并写 `mem`，插线回来时
+musb-sprd 处于 device 模式拒绝挂起（EBUSY），USB gadget 状态错乱，主机侧表现为 RNDIS 网卡、
+IPv4 栈与串口半枚举。
+
+修复：`gate()` 新增 `ED_USB_SETTLE`（默认 **6 s**），要求 `usb/online` 连续为 0 超过该时长
+才允许进入休眠循环。快速拔插不再误判，真正拔线长期使用只多等约 6 s。可用
+`ED_USB_SETTLE=0` 关闭（测试用途）。生产文件与源件 md5 `dc1d2234`。
+
 ### 已知待办（不阻塞使用）
 
 - **真实平均电流未测出**。此前用 `charge_counter` 差分算的 10.27 mA / 12.5 天已作废：

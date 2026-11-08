@@ -144,8 +144,9 @@ sh uninstall.sh
 
 ## 熄屏深睡守护（v1.0.7）
 
-`e5-deepsleep` 只在四个条件同时满足时才挂起：**没有 `/run/e5-deepsleep.off`、USB 未插、
-背光为 0、转发队列为空**。写 `/sys/power/state` 进 `mem`（当前 `mem_sleep` 为 `[deep]`），
+`e5-deepsleep` 只在四个条件同时满足时才挂起：**没有 `/run/e5-deepsleep.off`、USB 未插
+且已连续拔出超过 6 s（`ED_USB_SETTLE`，防止拔插瞬间误判）、背光为 0、转发队列为空**。
+写 `/sys/power/state` 进 `mem`（当前 `mem_sleep` 为 `[deep]`），
 RTC 兜底 600 s，队列有活时缩到 30 s；CP 的 `smsg` 消息会提前唤醒，醒来该收的短信、该发的
 转发都照常跑完，再进入下一轮。
 
@@ -167,6 +168,8 @@ cat /root/e5-deepsleep.log               # 每轮 slept / ovh / nap / 唤醒源
 
 > **注意**：开热点会触发 netifd 重载，**USB RNDIS 会断开**，届时改用串口或重新拔插 USB。
 > 这台设备默认只做短信转发、不做热点，所以常关是常态。
+> 需要远程调试时，开热点后主机连接 `E5-OpenWrt` 会拿到 `192.168.9.100`，可直接 SSH 到
+> `192.168.9.1`（USB 通道不通时的备用路径）。
 
 90 分钟实机窗口（未插线、wlan0 down、日志写 tmpfs）：107 轮、占空比 94.42%、挂起失败 0，
 唤醒源 100% `pscp-5:smsg-5-6`。剔除 >60 s 的长睡轮后短睡段占空比 74.97%。
