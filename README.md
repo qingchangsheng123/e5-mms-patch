@@ -1,15 +1,17 @@
 # e5-mms-patch
 
 E5（Unisoc UMS9621）OpenWrt 固件的短信盒子补丁。一台只用来收短信、转发到手机的随身设备，
-把四件让人难受的事修好：
+把五件让人难受的事修好：
 
 1. **彩信通知显示成乱码** —— 运营商发来的彩信到达通知（WAP Push）被当成普通短信解码，收件箱里是一串 `?<?` 之类的乱码。
 2. **短信转发失败即永久丢失** —— 内置转发脚本投递失败后不会重试，且消息 ID 已被占用，后续再也补发不了。
 3. **待机功耗 600-900mW 乱跳** —— 只要数据连接（PDP）保持激活，基带每约 26 秒唤醒一次 SIPA 加速器、每次约 10 秒 900mW。
    改成按需拨号后稳定在 **320mW**，首条短信的推送延迟 **7 秒**。
 4. **固件升级把补丁冲掉** —— `/usr` 会被覆盖，所以装了 START=19 的开机自愈，每次开机自动补回来并写日志。
+5. **拔线后 AP 还是一直醒着** —— 熄屏只关屏幕，CPU 不睡。加了深睡守护，未插线时循环挂起，由短信/CP 消息唤醒。
 
-补丁只改两个用户空间文件，其余都放在 `/etc/e5`（跨升级保留），不碰内核、不动固件分区，卸载可完整回滚。
+核心补丁只改两个用户空间文件；省电扩展另装一个 Python 守护（`/usr/sbin/e5-deepsleep`，源件留在
+`/etc/e5/power` 以便升级后自愈）。全部配置都在 `/etc/e5`（跨升级保留），不碰内核、不动固件分区，卸载可完整回滚。
 
 ## 环境要求
 
@@ -49,6 +51,15 @@ files/patch-forward.py  ->  /etc/e5/mms/patch-forward.py  （转发补丁）
 files/backfill.py       ->  /etc/e5/mms/backfill.py       （历史回填工具）
 files/install-core.sh   ->  /etc/e5/mms/install.sh        （核心安装逻辑）
 files/e5-mms.init       ->  /etc/init.d/e5-mms            （开机自愈，START=19）
+```
+
+省电扩展（同样由 `install.sh` 铺好，再由 S19 自愈链维护）：
+
+```
+files/power-install.sh   ->  /etc/e5/power/install.sh
+files/powersave.sh       ->  /etc/e5/power/powersave.sh
+files/e5-deepsleep       ->  /etc/e5/power/e5-deepsleep      （源件，自愈时铺回 /usr/sbin）
+files/e5-deepsleep.init  ->  /etc/e5/power/e5-deepsleep.init （源件，自愈时铺回 /etc/init.d）
 ```
 
 然后核心安装逻辑会：
@@ -128,7 +139,41 @@ sh uninstall.sh
 /etc/init.d/e5-data-ondemand stop && /etc/init.d/e5-data-ondemand disable
 /etc/init.d/e5-powersave stop && /etc/init.d/e5-powersave disable
 /etc/e5/power/powersave.sh off     # 恢复热点与蓝牙音频
+/etc/init.d/e5-deepsleep stop && /etc/init.d/e5-deepsleep disable
 ```
+
+## 熄屏深睡守护（v1.0.7）
+
+`e5-deepsleep` 只在四个条件同时满足时才挂起：**没有 `/run/e5-deepsleep.off`、USB 未插、
+背光为 0、转发队列为空**。写 `/sys/power/state` 进 `mem`（当前 `mem_sleep` 为 `[deep]`），
+RTC 兜底 600 s，队列有活时缩到 30 s；CP 的 `smsg` 消息会提前唤醒，醒来该收的短信、该发的
+转发都照常跑完，再进入下一轮。
+
+```sh
+/etc/init.d/e5-deepsleep status          # 服务状态
+touch /run/e5-deepsleep.off              # 临时禁睡（不重启服务）
+cat /root/e5-deepsleep.log               # 每轮 slept / ovh / nap / 唤醒源
+/etc/e5/power/powersave.sh status       # 热点、蓝牙、音频、WiFi 链路
+```
+
+开机省电模式默认关热点并 down 掉 `wlan0`：实测 `wifi down` 会让 wcn 驱动半死
+（MPM wakelock 每轮 0.78 s、挂起 EBUSY），所以一律用 `ip link set wlan0 down`。
+临时要开 WiFi：
+
+```sh
+/etc/e5/power/powersave.sh wlan-on
+/etc/e5/power/powersave.sh wlan-off
+```
+
+> **注意**：开热点会触发 netifd 重载，**USB RNDIS 会断开**，届时改用串口或重新拔插 USB。
+> 这台设备默认只做短信转发、不做热点，所以常关是常态。
+
+90 分钟实机窗口（未插线、wlan0 down、日志写 tmpfs）：107 轮、占空比 94.42%、挂起失败 0，
+唤醒源 100% `pscp-5:smsg-5-6`。剔除 >60 s 的长睡轮后短睡段占空比 74.97%。
+
+**真实平均电流尚未测出**：此前用 `charge_counter` 差分算出的 10.27 mA / 12.5 天已作废 ——
+该值是电量计按开路电压估算的 0.1% 步进值，拔线后回落到稳态点就不再变化，不是库仑计。
+需要过夜稳定段或外部电流表重测。另有一次 `time.sleep(0.5)` 被拉长到 3 s 的 AP 侧调度问题在查。
 
 ## 省电：按需蜂窝数据
 
@@ -226,6 +271,11 @@ files/
   backfill.py           历史乱码彩信回填
   install-core.sh       核心安装逻辑（装成 /etc/e5/mms/install.sh）
   e5-mms.init           开机自愈服务
+  power-install.sh      省电扩展自愈安装（含深睡守护）
+  powersave.sh          省电开关 / WiFi 手动开关
+  e5-deepsleep          深睡守护（Python）
+  e5-deepsleep.init     深睡守护 procd 服务
+  data-ondemand.sh      按需蜂窝数据
 ```
 
 ## 打包分发
@@ -241,6 +291,9 @@ sh package.sh
 - 加密通知只有 URL，且该 URL 通常需要手机侧鉴权，直接打开多半失败。
 - 依赖上游 `sms_pdu.py` / `sms-forward` 的现有结构；固件大改版后 `patch-forward.py` 可能报"锚点对不上"，此时需要跟进适配。
 - 只支持单个 modem 实例（`Modem/0`）。
+- 深睡守护的真实平均功耗未测（见上节），短睡段仍被 CP `smsg-5-6` 高频簇打断，约 8-10 s 醒一次；
+  静默期可连睡 600 s，整轮占空比取决于两种状态的占比。
+- 开热点会断开 USB RNDIS；深睡期间 SSH 不可达，调试请插线或用串口。
 
 ## 许可
 

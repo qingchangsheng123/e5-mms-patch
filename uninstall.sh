@@ -41,6 +41,15 @@ rm -f /etc/init.d/e5-mms
 rm -f /usr/bin/e5-forward
 echo "已停用开机自愈服务 e5-mms"
 
+# v1.0.7 深睡守护（procd respawn，停服务要用 ubus 删实例，pkill 追不上）
+if [ -x /etc/init.d/e5-deepsleep ]; then
+	/etc/init.d/e5-deepsleep stop >/dev/null 2>&1 || true
+	ubus call service delete '{"name":"e5-deepsleep"}' >/dev/null 2>&1 || true
+	/etc/init.d/e5-deepsleep disable >/dev/null 2>&1 || true
+	touch /run/e5-deepsleep.off
+	echo "已停用深睡守护（源件保留在 /etc/e5/power）"
+fi
+
 # 让接收进程重开，重新加载原版解码器
 if [ "$CHANGED" = "1" ]; then
 	for pid in $(receiver); do

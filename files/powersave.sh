@@ -3,6 +3,7 @@
 #   powersave.sh on      关热点 + 停蓝牙/音频
 #   powersave.sh off     恢复原厂（热点开、蓝牙音频开）
 #   powersave.sh status  查看当前状态
+#   powersave.sh wlan-on|wlan-off  仅开关 WiFi 链路（调试用，不动蓝牙/音频）
 #
 # 实测（HiZ 停充、20×3s 采样、静置后测）：
 #   热点开  ≈ 750-800mW
@@ -35,6 +36,8 @@ do_status() {
 	uci -q get e5-audio.main.enabled | sed 's/^1$/开/; s/^0$/关/' | tr -d '\n'; echo
 	echo -n "短信转发:  "
 	ps w | grep -q '[e]5-sms-receive serve' && echo "运行中" || echo "未运行"
+	echo -n "WiFi链路:  "
+	ip -br link show wlan0 2>/dev/null | awk '{print $2}' | tr -d '\n'; echo
 }
 
 case "$MODE" in
@@ -60,11 +63,20 @@ on)
 	done
 	sleep 2
 	timeout 5 rfkill block bluetooth 2>/dev/null
+	# 深睡守护要求 wlan0 链路关闭：只关 hostapd（$HS off）不够。
+	# 实测 `ip link set wlan0 down` 保留 wcn 驱动且消除 sdiohal/Wi-Fi_cmd 唤醒；
+	# `wifi down` 会让驱动半死（MPM wakelock 0.78s/次、挂起 EBUSY），禁用。
+	if ip link show wlan0 >/dev/null 2>&1; then
+		ip link set wlan0 down 2>/dev/null
+	fi
 	echo "已开启省电模式"
 	do_status
 	;;
 off)
 	$HS on >/dev/null 2>&1
+	if ip link show wlan0 >/dev/null 2>&1; then
+		ip link set wlan0 up 2>/dev/null
+	fi
 	uci set e5-bluetooth.main.enabled=1; uci set e5-bluetooth.main.autostart=1; uci commit e5-bluetooth
 	uci set e5-audio.main.enabled=1; uci commit e5-audio
 	for s in e5-audio e5-pulseaudio e5-voice-audio pulseaudio e5-bt bluetoothd e5-hfp; do
@@ -77,12 +89,22 @@ off)
 	echo "已恢复原厂模式"
 	do_status
 	;;
+wlan-on)
+	$HS on >/dev/null 2>&1
+	if ip link show wlan0 >/dev/null 2>&1; then ip link set wlan0 up 2>/dev/null; fi
+	do_status
+	;;
+wlan-off)
+	$HS off >/dev/null 2>&1
+	if ip link show wlan0 >/dev/null 2>&1; then ip link set wlan0 down 2>/dev/null; fi
+	do_status
+	;;
 status)
 	do_status
 	;;
 *)
 	do_status
 	echo
-	echo "用法: $0 on|off|status"
+	echo "用法: $0 on|off|status|wlan-on|wlan-off"
 	;;
 esac

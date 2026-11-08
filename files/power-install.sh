@@ -2,6 +2,7 @@
 # /etc/e5/power/install.sh —— 省电扩展的自愈安装
 #
 # 由 /etc/e5/mms/install.sh 的自愈链在开机时调用（S19，早于网络服务），
+# v1.0.7 起同时负责铺回深度休眠守护。
 # 系统升级会清掉 /etc/init.d 下的自建服务，这里把文件与自启链接补回来。
 #
 # 只负责"文件就位 + 建自启"，不主动拉起守护：
@@ -37,6 +38,26 @@ if [ -f "$DIR/powersave.sh" ] && [ -f "$DIR/e5-powersave.init" ]; then
 	echo "省电自启已就位"
 else
 	echo "跳过省电自启：缺少 powersave.sh 或 init"
+fi
+
+# ---------- 3. 深度休眠守护（v1.0.7） ----------
+# 源件留在 /etc/e5/power/（整目录进备份包，固件升级不清），
+# 目标 /usr/sbin 与 /etc/init.d 的自建文件会被升级覆盖，这里铺回并建自启。
+# 开机早期由 S99 自动拉起；手动重装（uptime>120）时若没在跑就直接 start。
+if [ -f "$DIR/e5-deepsleep" ] && [ -f "$DIR/e5-deepsleep.init" ]; then
+	cp -f "$DIR/e5-deepsleep" /usr/sbin/e5-deepsleep
+	chmod 755 /usr/sbin/e5-deepsleep
+	cp -f "$DIR/e5-deepsleep.init" /etc/init.d/e5-deepsleep
+	chmod 755 /etc/init.d/e5-deepsleep
+	/etc/init.d/e5-deepsleep enable >/dev/null 2>&1 || true
+	if ps w | grep -q '[e]5-deepsleep'; then
+		/etc/init.d/e5-deepsleep restart >/dev/null 2>&1 || true
+	elif [ "$(cut -d. -f1 /proc/uptime)" -gt 120 ]; then
+		/etc/init.d/e5-deepsleep start >/dev/null 2>&1 || true
+	fi
+	echo "深睡守护已就位"
+else
+	echo "跳过深睡守护：缺少 e5-deepsleep 或 init"
 fi
 
 exit 0

@@ -92,8 +92,11 @@ if [ -f "$SRCDIR/files/powersave.sh" ] && [ -f "$SRCDIR/files/data-ondemand.sh" 
 	cp "$SRCDIR/files/e5-data-ondemand.init" /etc/e5/power/e5-data-ondemand.init && chmod 755 /etc/e5/power/e5-data-ondemand.init
 	cp "$SRCDIR/files/e5-powersave.init" /etc/e5/power/e5-powersave.init && chmod 755 /etc/e5/power/e5-powersave.init
 	cp "$SRCDIR/files/power-install.sh" /etc/e5/power/install.sh && chmod 755 /etc/e5/power/install.sh
+	# v1.0.7：深睡守护的源件必须先就位，install.sh 第 3 段才会铺回 /usr/sbin 并建自启
+	cp "$SRCDIR/files/e5-deepsleep" /etc/e5/power/e5-deepsleep && chmod 755 /etc/e5/power/e5-deepsleep
+	cp "$SRCDIR/files/e5-deepsleep.init" /etc/e5/power/e5-deepsleep.init && chmod 755 /etc/e5/power/e5-deepsleep.init
 	sh /etc/e5/power/install.sh >/dev/null 2>&1 || true
-	say "省电扩展已就位（按需拨号、开机省电）"
+	say "省电扩展已就位（按需拨号、开机省电、深睡守护）"
 fi
 
 # 开机自愈：系统升级会覆盖 /usr 下的东西，靠这个 S19 服务补回来

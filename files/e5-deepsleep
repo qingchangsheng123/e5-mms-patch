@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""e5-deepsleep - 熄屏且未插线时循环进入深度休眠，醒来立即再睡。
+
+门禁（任一不满足就不睡，退化为普通待机）：
+  1. 不存在 /run/e5-deepsleep.off
+  2. /sys/class/power_supply/usb/online == 0
+     插线时 musb-sprd 在 device 模式直接 -EBUSY，而且充电管理器每 15 s 唤醒一次
+  3. 背光 == 0（亮屏说明有人在用）
+  4. 短信转发队列为空（有待发短信就先让它跑完）
+
+睡眠用 RTC 做长兜底（默认 600 s），正常情况下由 CP 消息（smsg）提前唤醒。
+实测唤醒后用户态能完整跑完短信接收与转发，deep 不冻结用户态。
+"""
+import calendar
+import fcntl
+import os
+import signal
+import struct
+import sys
+import time
+
+PID = "/run/e5-deepsleep.pid"
+OFF = "/run/e5-deepsleep.off"
+LOG = "/root/e5-deepsleep.log"
+LOG_MAX = 262144          # 256 KB 后截断保留尾部
+LOG_KEEP = 600            # 保留行数
+
+QUEUE = "/etc/unisoc-modem/forward/queue"
+BL = "/sys/class/backlight/sprd_backlight/brightness"
+USB_ON = "/sys/class/power_supply/usb/online"
+ALARM = "/sys/class/rtc/rtc0/wakealarm"
+STATE = "/sys/power/state"
+MEM_SLEEP = "/sys/power/mem_sleep"
+SYNC = "/sys/power/sync_on_suspend"
+MPM = "/sys/kernel/debug/mpm/power_manage"
+
+# 可调参数（环境变量覆盖）
+RTC_IDLE = int(os.environ.get("ED_RTC", "600"))        # 正常兜底
+RTC_BUSY = int(os.environ.get("ED_RTC_BUSY", "30"))    # 队列有活时的短兜底
+GAP = float(os.environ.get("ED_GAP", "0.5"))           # 入睡前的静默等待
+IDLE_GATED = float(os.environ.get("ED_IDLE", "5"))     # 门禁不通过时的轮询
+DRYRUN = os.environ.get("ED_DRYRUN", "0") == "1"
+FORCE_USB = os.environ.get("ED_FORCE_USB", "0") == "1"   # 测试用：忽略 usb-online 门禁
+SYNC_OFF = os.environ.get("ED_SYNC_OFF", "1") == "1"     # 关掉 sync_on_suspend
+LOGBUF_EVERY = float(os.environ.get("ED_LOGBUF", "20"))  # 日志落盘最小间隔
+DMESG = os.environ.get("ED_DMESG", "0") == "1"          # 每轮抓 dmesg 唤醒线索（测试用）
+SUMMARY_EVERY = float(os.environ.get("ED_SUMMARY", "300"))
+DUR = float(os.environ.get("ED_DUR", "0"))             # >0 时到点自动退出（仅测试用）
+
+STOP = False
+
+
+def _on_sig(signum, frame):
+    global STOP
+    STOP = True
+
+
+def rd(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def wr(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+        return True
+    except Exception:
+        return False
+
+
+_BUF = []
+_BUF_T = [0.0]
+
+
+def _flush(force=False):
+    """把缓存行落盘。armed 期间尽量少写，避免 sync_on_suspend 带动 flash I/O。"""
+    if not _BUF:
+        return
+    now = time.time()
+    if not force and now - _BUF_T[0] < LOGBUF_EVERY:
+        return
+    try:
+        with open(LOG, "a") as f:
+            f.writelines(_BUF)
+        del _BUF[:]
+        _BUF_T[0] = now
+    except Exception:
+        pass
+    if not DRYRUN:
+        try:
+            if os.path.getsize(LOG) > LOG_MAX:
+                with open(LOG) as f:
+                    tail = f.readlines()[-LOG_KEEP:]
+                with open(LOG, "w") as f:
+                    f.writelines(tail)
+        except Exception:
+            pass
+
+
+def log(msg, force=False):
+    line = "[%s] %s\n" % (time.strftime("%m-%d %H:%M:%S"), msg)
+    _BUF.append(line)
+    _flush(force=force)
+
+
+RTC_DEV = "/dev/rtc0"
+
+
+def _ioc(dirs, t, nr, size):
+    return (dirs << 30) | (size << 16) | (ord(t) << 8) | nr
+
+
+RTC_RD_TIME = _ioc(2, "p", 0x09, 36)      # _IOR('p', 0x09, struct rtc_time)
+RTC_WKALM_SET = _ioc(1, "p", 0x0f, 40)    # _IOW('p', 0x0f, struct rtc_wkalrm)
+_ALARM_MODE = [0]                          # 0=未探明 1=ioctl 2=退回 sysfs
+
+
+def set_alarm(seconds):
+    """设 wakealarm。返回 True 表示已设好。
+
+    sysfs 路径必须「先写 0 清掉旧 alarm 再写 +N」，实测两次写共 0.46 s
+    （外部 I2C RTC，每次写都是一次完整 I2C 事务），是每轮醒着时间里最大的一块。
+    ioctl 一次系统调用几毫秒，且能直接覆盖旧 alarm。
+    RTC 存的是 UTC，所以全程用 timegm/gmtime，不碰本地时区。
+    """
+    if _ALARM_MODE[0] != 2:
+        try:
+            fd = os.open(RTC_DEV, os.O_RDWR)
+            try:
+                buf = bytearray(36)
+                fcntl.ioctl(fd, RTC_RD_TIME, buf, True)
+                tm = struct.unpack("9i", bytes(buf))
+                base = calendar.timegm((tm[5] + 1900, tm[4] + 1, tm[3],
+                                        tm[2], tm[1], tm[0], 0, 0, 0))
+                g = time.gmtime(base + int(seconds))
+                body = struct.pack("9i", g.tm_sec, g.tm_min, g.tm_hour,
+                                   g.tm_mday, g.tm_mon - 1, g.tm_year - 1900,
+                                   0, 0, 0)
+                fcntl.ioctl(fd, RTC_WKALM_SET, struct.pack("BB2x", 1, 0) + body)
+            finally:
+                os.close(fd)
+            if _ALARM_MODE[0] == 0:
+                log("rtc: ioctl 快路径启用（省 0.46s/轮）", force=True)
+            _ALARM_MODE[0] = 1
+            return True
+        except Exception:
+            _ALARM_MODE[0] = 2
+            log("rtc: ioctl 不可用，退回 sysfs（每轮多 0.46s）", force=True)
+    wr(ALARM, "0")
+    return wr(ALARM, "+%d" % int(seconds))
+
+
+def qlen():
+    try:
+        return len(os.listdir(QUEUE))
+    except Exception:
+        return -1
+
+
+def gate():
+    """返回 (可睡, 原因)。"""
+    if os.path.exists(OFF):
+        return False, "off-flag"
+    u = rd(USB_ON, "?")
+    if u != "0" and not FORCE_USB:
+        return False, "usb-online=%s" % u
+    b = rd(BL, "?")
+    if b not in ("0", ""):
+        return False, "screen-on=%s" % b
+    return True, "ok"
+
+
+def cp_busy():
+    """CP 侧是否还有未收完的消息（wakelock_cnt>0 表示基带那边正挂着锁）。"""
+    busy, _ = mpm_snapshot()
+    best = -1
+    for _, (wl, _) in busy.items():
+        if wl > best:
+            best = wl
+    return best
+
+
+def mpm_snapshot():
+    """返回 ({mpm名: (wakelock_cnt, awake_cnt)}, {mpm名: last_module})。"""
+    cnt, last = {}, {}
+    try:
+        with open(MPM) as f:
+            txt = f.read()
+    except Exception:
+        return cnt, last
+    for seg in txt.split("mpm = ")[1:]:
+        lines = seg.splitlines()
+        if not lines:
+            continue
+        name = lines[0].split()[0]
+        wl, aw = 0, 0
+        for line in lines:
+            s = line.strip()
+            if s.startswith("last up module = "):
+                last[name] = s[len("last up module = "):].split()[0]
+            elif s.startswith("wakelock_cnt="):
+                for part in s.split(","):
+                    part = part.strip()
+                    if part.startswith("wakelock_cnt="):
+                        try:
+                            wl = int(part.split("=")[1])
+                        except Exception:
+                            pass
+                    elif part.startswith("awake_cnt="):
+                        try:
+                            aw = int(part.split("=")[1])
+                        except Exception:
+                            pass
+        cnt[name] = (wl, aw)
+    return cnt, last
+
+
+def bt():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def mono():
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+def nap(seconds, breakable=True):
+    """分段睡眠，便于 STOP 或门禁变化时快速退出。
+
+    计时用 CLOCK_BOOTTIME，与守护全部打点一致。原实现用 MONOTONIC，
+    resume 后 0.5s 的等待被拉长成离散的 0.50/1.00/3.00 s，每轮白等最多 2.5s。
+    """
+    end = bt() + seconds
+    while bt() < end:
+        if STOP:
+            return
+        time.sleep(min(0.5, max(0.05, end - bt())))
+
+
+def single_cycle():
+    """做一次挂起。返回 (结果, 睡眠秒数, 挂起开始 bt, 挂起返回 bt, 挂起开销秒数)。
+
+    开销 ovh = m2-m1：挂起准备 + resume 期间 MONOTONIC 在走，CPU 是醒着的。
+    slept 把它扣掉了，所以必须单独交回调用方计入 awake，否则占空比会被高估。
+    """
+    ok, why = gate()
+    if not ok:
+        return "gate:" + why, 0.0, 0.0, 0.0, 0.0
+
+    q = qlen()
+    rtc = RTC_IDLE if q <= 0 else RTC_BUSY
+
+    set_alarm(rtc)
+
+    b1, m1 = bt(), mono()
+    if DRYRUN:
+        time.sleep(0.2)
+        return "dryrun(rtc=%d,q=%d)" % (rtc, q), 0.0, b1, bt(), 0.2
+    sent = wr(STATE, "mem\n")
+    b2, m2 = bt(), mono()
+
+    ovh = max(m2 - m1, 0.0)
+    slept = (b2 - b1) - (m2 - m1)
+    if not sent:
+        return "EBUSY", max(slept, 0.0), b1, b2, ovh
+    return "ok", max(slept, 0.0), b1, b2, ovh
+
+
+def dmesg_wake():
+    """取上次调用之后新增的、与电源/唤醒相关的 dmesg 行，压成一行短摘要。"""
+    try:
+        out = os.popen("dmesg 2>/dev/null").read().splitlines()
+    except Exception:
+        return ""
+    if _DM_N[0] < 0 or _DM_N[0] > len(out):
+        _DM_N[0] = len(out)
+        return ""
+    new = out[_DM_N[0]:]
+    _DM_N[0] = len(out)
+    hits = []
+    for line in new:
+        low = line.lower()
+        if any(k in low for k in _KW):
+            body = line.split("]", 1)[-1].strip()
+            hits.append(body[:58])
+    return "; ".join(hits[-2:])
+
+
+_DM_N = [-1]
+_KW = ("wakeup", "is awake", "abort", "suspend", "disconnect", "sdiohal",
+       "charger", "pm:", "resume", "wcn", "hif")
+
+
+def main():
+    log("start pid=%d rtc=%d/%d gap=%.1f dur=%.0f dry=%d"
+        % (os.getpid(), RTC_IDLE, RTC_BUSY, GAP, DUR, int(DRYRUN)), force=True)
+    if DRYRUN:
+        log("=== DRYRUN start (no real suspend) ===", force=True)
+    else:
+        wr(MEM_SLEEP, "deep")
+        if SYNC_OFF:
+            # sync_on_suspend 会让每次挂起都做一次全量 fs sync，flash I/O 会把挂起打断
+            log("sync_on_suspend=%s -> 0" % rd(SYNC, "?"), force=True)
+            wr(SYNC, "0")
+
+    signal.signal(signal.SIGTERM, _on_sig)
+    signal.signal(signal.SIGINT, _on_sig)
+
+    n = 0
+    total_sleep = 0.0
+    total_ovh = 0.0        # 挂起准备 + resume 的 CPU 醒着时间
+    awake = 0.0            # 武装状态下的醒着时间（不含 idle）
+    t_start = bt()
+    t_sum = bt()
+    prev_end = None
+    fails = 0
+    tiny = 0
+    last_reason = ""
+
+    gap = GAP
+    while not STOP:
+        if DUR > 0 and bt() - t_start >= DUR:
+            log("time limit %.0fs reached" % DUR)
+            break
+        ok, why = gate()
+        if not ok:
+            if why != last_reason:
+                log("idle: %s" % why, force=True)
+                last_reason = why
+            nap(IDLE_GATED)
+            continue
+        if last_reason:
+            log("armed: 门禁通过，进入休眠循环", force=True)
+            last_reason = ""
+
+        # 有短信待发：先让它跑完，最多等 120 s
+        if qlen() > 0:
+            log("queue=%d 有转发任务，暂不睡" % qlen())
+            end = mono() + 120
+            while mono() < end and not STOP:
+                if gate()[0] is False:
+                    break
+                if qlen() <= 0:
+                    break
+                nap(2)
+            if STOP:
+                break
+            if not gate()[0]:
+                continue
+
+        # 静默等待，让 URC→用户态处理完（短信从 URC 到落队列实测 1-3 s）
+        nap(gap)
+        if STOP:
+            break
+        ok, why = gate()
+        if not ok:
+            continue
+        if qlen() > 0:
+            continue
+
+        sn1, nm1 = mpm_snapshot()
+        busy = max([v[0] for v in sn1.values()], default=-1)
+        res, slept, b1, b2, ovh = single_cycle()
+        sn2, nm2 = mpm_snapshot()
+        n += 1
+        total_sleep += slept
+        total_ovh += ovh
+
+        # 记录本轮 MPM 计数增量，用于判断是谁把系统叫醒的
+        wake = []
+        for k, (_, aw2) in sn2.items():
+            aw1 = sn1.get(k, (0, aw2))[1]
+            d = aw2 - aw1
+            if d > 0:
+                short = k.replace("sipc-", "").replace("-mpm", "")
+                wake.append("%s:%s+%d" % (short, nm2.get(k, "?"), d))
+        wstr = " ".join(wake) if wake else "-"
+        if prev_end is not None and b1 > prev_end:
+            awake += b1 - prev_end
+        # 挂起准备 + resume 的 CPU 醒着时间（slept 里被扣掉的那部分），必须计入
+        awake += ovh
+        prev_end = b2
+
+        if DMESG and slept < 12:
+            d = dmesg_wake()
+            if d:
+                wstr = (wstr + " | " + d)[:220]
+
+        if res == "EBUSY":
+            # 基带 500 ms wakelock 还在，等一个锁周期就重试，不必重新走静默期
+            fails += 1
+            if fails <= 3 or fails % 20 == 0:
+                log("c%03d 挂起被拒 (EBUSY) x%d" % (n, fails))
+            nap(0.6)
+            gap = 5.0 if fails >= 5 else 0.6
+            continue
+        fails = 0
+
+        # 等待策略：GAP 是给「URC → 用户态 → 落队列」留的时间，不是惩罚项。
+        # 消息密集期（CP 每 2-3 s 就来一条）最不该拉长等待，否则醒着时间被 GAP 掏空。
+        #   <0.2 s  挂起没走完就被打断，快速重试；连撞 5 次才退让
+        #   队列有活 / CP 还挂着锁 -> 等它处理完
+        #   其余一律回 GAP
+        if slept < 0.2:
+            tiny += 1
+            gap = 8.0 if tiny >= 5 else 1.0
+        else:
+            tiny = 0
+            if qlen() > 0 or cp_busy() > 0:
+                gap = max(GAP, 3.0)
+            else:
+                gap = GAP
+
+        flag = "" if slept >= 5 else " (!)"
+        if n <= 40 or n % 10 == 0:
+            log("c%03d slept=%6.2f ovh=%4.2f q=%d cp=%s wake[%s]%s"
+                % (n, slept, ovh, qlen(), busy, wstr, flag))
+
+        if bt() - t_sum >= SUMMARY_EVERY:
+            tot = total_sleep + awake
+            log("== 汇总 轮次=%d 睡眠=%.1fs 醒=%.1fs(含开销%.1fs) 占空比=%.1f%% 失败=%d"
+                % (n, total_sleep, awake, total_ovh,
+                   100.0 * total_sleep / tot if tot > 0 else 0, fails), force=True)
+            t_sum = bt()
+
+    tot = total_sleep + awake
+    log("=== stopped: 轮次=%d 睡眠=%.1fs 醒=%.1fs(含开销%.1fs) 占空比=%.1f%%"
+        % (n, total_sleep, awake, total_ovh,
+           100.0 * total_sleep / tot if tot > 0 else 0), force=True)
+    try:
+        os.unlink(PID)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    with open(PID, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        main()
+    except Exception as e:
+        log("FATAL %r" % (e,))
+        sys.exit(1)
+
+
