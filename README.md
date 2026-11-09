@@ -211,8 +211,9 @@ cat /sys/class/net/usb0/statistics/rx_packets   # 打几个包后计数不动 = 
 内核重启。开机自检 `e5-usb-guard`（S99）在插线且状态异常或 ping 不通主机时自动调用恢复工具。
 
 源件在 `/etc/e5/usb/`，由 `/etc/e5/power/install.sh` 第 4 段随 S19 自愈链铺回，
-固件升级不会丢。`/root/pm-test.sh` 是过夜功耗测试脚本（一次性用途），测试期间会临时
-停掉三个周期性唤醒源并在结束时恢复。
+固件升级不会丢。`/root/pm-test.sh` 是过夜功耗测试脚本（一次性用途，v5），测试期间会临时
+停掉三个周期性唤醒源并在结束时恢复。采样用 wall 时间闸门而非 `sleep`，因此 AP 深睡挂起时
+不会漏采，也不额外增加唤醒源；收尾会打印 `SAMPLES n / maxgap / overshoot` 供核对。
 
 ## 省电：按需蜂窝数据
 
@@ -318,7 +319,7 @@ files/
   e5-usb-recover        USB gadget 软件拔插复位
   e5-usb-guard-check    开机自检逻辑
   e5-usb-guard.init     开机自检服务（S99/K10）
-  pm-test.sh            过夜功耗测试（源件放 /etc/e5/usb/，装到 /root）
+  pm-test.sh            过夜功耗测试 v5（源件放 /etc/e5/usb/，装到 /root）
 ```
 
 ## 打包分发
