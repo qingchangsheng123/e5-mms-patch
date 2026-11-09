@@ -1,5 +1,15 @@
 #!/bin/sh
-# E5 过夜功耗测试 v4（2026-11-09 审计后修订）
+# E5 过夜功耗测试 v5（2026-11-09 #8 修复）
+# v4 -> v5：
+#   修复「STEP 采样间隔在深睡下失效」（#8）：sleep 用 CLOCK_MONOTONIC，suspend 期间
+#   定时器不推进，实测 120s 被拉长到 1069-5652s，5h 只采到 8 个点（设计 150 个）。
+#   改为 1s 短轮询 + wall 时间闸门：date +%s 走 CLOCK_REALTIME，跨 suspend 照常推进，
+#   只有跨过下一个采样点才 sample。脚本不主动唤醒系统，搭深睡守护唤醒的便车，
+#   因此零新增唤醒源；实际间隔约等于守护唤醒周期的整数倍（~90s 的倍数）。
+#   cc_mah 是累计量，用 wall 真实时间做差分/回归仍然成立。
+#   EARLY replug 的 sleep 10 不改：插线本身会唤醒设备，此后不再 suspend。
+#   新增 SAMPLES 诊断（采样数 / 最大间隔 / 超间隔次数），写日志与 DONE 便于验证。
+#   sync 由每 10 条改为每 30 条：采样变密后避免频繁刷 ext4 journal 污染测量。
 # v3 -> v4：
 #   新增「测量静默窗口」：仅在真正拔线开跑时临时停掉三个常驻唤醒源
 #   （e5-powersam 60s / powermon 10s / cron rebind.sh），脚本结束或异常退出
@@ -14,7 +24,7 @@
 #
 # 采样列：wall boottime cap_fgu(0.1%) cap_bat(%) voltage_uV current_uA temp status usb cc_mah
 # 启动：start-stop-daemon -S -b -x /root/pm-test.sh
-# 参数：DUR=秒 STEP=秒 WAITMAX=秒 START_AFTER=epoch
+# 参数：DUR=秒 STEP=秒 WAITMAX=秒 START_AFTER=epoch POLL=秒（轮询周期，默认 1）
 
 LOG=/root/e5-pmtest.log
 PM=/root/e5-pmtest-pm.log
@@ -32,7 +42,10 @@ DUR=${DUR:-25200}
 STEP=${STEP:-120}
 WAITMAX=${WAITMAX:-43200}
 START_AFTER=${START_AFTER:-0}
+POLL=${POLL:-1}
 N=0
+MAXGAP=0
+OVERSHOOT=0
 
 log() {
 	echo "$(date '+%F %T') $*" >>"$LOG"
@@ -76,7 +89,7 @@ cc_mah() {
 sample() {
 	echo "$(date +%s) $(cut -d' ' -f1 /proc/uptime) $(cat $FGU/capacity 2>/dev/null) $(cat $BAT/capacity 2>/dev/null) $(cat $BAT/voltage_now 2>/dev/null) $(cat $BAT/current_now 2>/dev/null) $(cat $BAT/temp 2>/dev/null) $(cat $BAT/status 2>/dev/null | tr -d ' ') $(cat $USB 2>/dev/null) $(cc_mah)" >>"$PM"
 	N=$((N + 1))
-	[ $((N % 10)) -eq 0 ] && sync
+	[ $((N % 30)) -eq 0 ] && sync
 }
 
 if [ -f "$RUNF" ]; then
@@ -90,7 +103,7 @@ fi
 echo $$ >"$RUNF"
 rm -f "$DONE"
 
-log "=== ARMED v4 usb=$(cat $USB 2>/dev/null) dur=$DUR step=$STEP waitmax=$WAITMAX start_after=$START_AFTER"
+log "=== ARMED v5 usb=$(cat $USB 2>/dev/null) dur=$DUR step=$STEP poll=$POLL waitmax=$WAITMAX start_after=$START_AFTER"
 
 # --- 1. 等拔线：必须「已到允许时刻」且连续 30s usb=0 ---
 i=0
@@ -125,28 +138,44 @@ ip link set wlan0 down 2>/dev/null
 sleep 3
 log "WLAN down state=$(ip -br link show wlan0 2>/dev/null | awk '{print $2}')"
 
-# --- 3. 采样主循环 ---
+# --- 3. 采样主循环（v5：短轮询 + wall 时间闸门，零新增唤醒源）---
 : >"$PM"
 echo "# wall boottime cap_fgu(0.1%) cap_bat(%) voltage_uV current_uA temp status usb cc_mah" >>"$PM"
 sync
 T0=$(date +%s)
 TEND=$((T0 + DUR))
+NEXT=$((T0 + STEP))
+LAST=$T0
 sample
-log "RUN start T0=$T0 TEND=$TEND"
+log "RUN start T0=$T0 TEND=$TEND step=$STEP poll=$POLL"
 
-while [ "$(date +%s)" -lt "$TEND" ]; do
-	sleep "$STEP"
-	sample
+while :; do
+	now=$(date +%s)
+	[ "$now" -ge "$TEND" ] && break
+	if [ "$now" -ge "$NEXT" ]; then
+		sample
+		gap=$((now - LAST))
+		[ "$gap" -gt "$MAXGAP" ] && MAXGAP=$gap
+		[ "$gap" -gt $((STEP * 3 / 2)) ] && OVERSHOOT=$((OVERSHOOT + 1))
+		LAST=$now
+		# 深睡期间可能跨过多个 STEP，历史点无法回溯，从当前时刻重新对齐
+		NEXT=$((now + STEP))
+	fi
 	if [ "$(cat $USB 2>/dev/null)" = "1" ]; then
 		sleep 10
 		[ "$(cat $USB 2>/dev/null)" = "1" ] && { log "EARLY replug"; break; }
 	fi
+	sleep "$POLL"
 done
 
+now=$(date +%s)
+gap=$((now - LAST))
+[ "$gap" -gt "$MAXGAP" ] && MAXGAP=$gap
 sample
 sync
 T1=$(date +%s)
 log "RUN end T1=$T1 elapsed=$((T1 - T0))"
+log "SAMPLES n=$N maxgap=${MAXGAP}s overshoot=$OVERSHOOT step=$STEP poll=$POLL"
 
 # --- 4. 收尾：恢复采样器、抽守护日志、恢复 WiFi ---
 quiet_end
@@ -156,7 +185,7 @@ tail -n +$((L0 + 1)) "$SLEEPLOG" >/root/e5-pmtest-sleep.log 2>/dev/null
 log "SLEEPLOG L1=$L1 new=$((L1 - L0))"
 log "SUMMARY $(grep '汇总' /root/e5-pmtest-sleep.log 2>/dev/null | tail -1)"
 
-echo "DONE $(date '+%F %T') elapsed=$((T1 - T0))s sleep_new=$((L1 - L0))" >"$DONE"
+echo "DONE $(date '+%F %T') elapsed=$((T1 - T0))s sleep_new=$((L1 - L0)) samples=$N maxgap=${MAXGAP}s overshoot=$OVERSHOOT" >"$DONE"
 sync
 
 ip link set wlan0 up 2>/dev/null
