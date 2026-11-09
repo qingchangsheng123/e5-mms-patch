@@ -1,0 +1,61 @@
+#!/bin/sh
+# e5-usb-guard-check —— 开机后自检 USB gadget，卡死就软件插拔一次
+#
+# 定位：厂商 /opt/e5/usb-watch.sh 常驻，但它在 state=configured 时直接跳过，
+#       处理不了"configured 但 usb0 收发计数不动"的数据面卡死。本自检用
+#       设备侧 ping 主机补这个缺口；两者通过 e5-usb-recover 的 lock 互斥。
+#
+# 触发条件（同时满足才动手）：
+#   usb/online = 1（线插着、有 VBUS）
+#   且 UDC state != configured（连续两次确认），或 configured 但 ping 不通主机
+#
+# 由 /etc/init.d/e5-usb-guard 用 start-stop-daemon -b 拉起（脱离会话）。
+# 也可以手工前台跑：GUARD_DELAY=0 e5-usb-guard-check
+
+HOST=${GUARD_HOST:-192.168.9.2}
+DELAY=${GUARD_DELAY:-25}
+UDC=/sys/class/udc/musb-hdrc.1.auto
+ONLINE=/sys/class/power_supply/usb/online
+
+sleep "$DELAY"
+
+usb=$(cat "$ONLINE" 2>/dev/null)
+if [ "$usb" != "1" ]; then
+	logger -t e5-usb-guard "skip: usb_online=$usb"
+	exit 0
+fi
+
+st=$(cat "$UDC/state" 2>/dev/null)
+if [ "$st" != "configured" ]; then
+	# 开机早期 watch 可能正在处理，等一轮再确认，避免两边抢 soft_connect
+	sleep 8
+	st=$(cat "$UDC/state" 2>/dev/null)
+	if [ "$st" = "configured" ]; then
+		logger -t e5-usb-guard "state recovered by watch: $st, nothing to do"
+		exit 0
+	fi
+	logger -t e5-usb-guard "state=$st (2nd check) -> recover"
+	/usr/sbin/e5-usb-recover >/dev/null 2>&1
+	sleep 6
+else
+	# 主机可能还没起来，连续两次失败才判定数据面卡死
+	if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
+		logger -t e5-usb-guard "state=configured ping=$HOST ok, nothing to do"
+		exit 0
+	fi
+	sleep 4
+	if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
+		logger -t e5-usb-guard "state=configured ping=$HOST ok (2nd try), nothing to do"
+		exit 0
+	fi
+	logger -t e5-usb-guard "state=configured but ping $HOST failed twice -> recover"
+	/usr/sbin/e5-usb-recover >/dev/null 2>&1
+	sleep 6
+fi
+
+st=$(cat "$UDC/state" 2>/dev/null)
+if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
+	logger -t e5-usb-guard "after recover: state=$st ping=ok"
+else
+	logger -t e5-usb-guard "after recover: state=$st ping=fail"
+fi

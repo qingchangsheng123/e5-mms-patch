@@ -3,6 +3,38 @@
 最终版本，从一台实机（E5 / UMS9621 / `6.18.54-e5-sleep16`）的部署中逐步修正而来。
 早期迭代号（1.0.0 / 1.0.1 / 1.0.2）已从仓库撤销，其修复内容都并入本版本，不再单独发布。
 
+## 1.0.8 — 2026-11-09
+
+纯闭环版本，核心逻辑（彩信解码、转发重试、深睡守护）一行未改。
+
+### 新增：USB gadget 自愈工具并纳入开机自愈链
+
+现场出现过一次「UDC `state=configured`、`usb0` UP、`carrier=1`，但 `usb0` 收发计数一动不动」
+的 RNDIS 数据面卡死。此时主机侧 ping 看似能通，其实是同网段的 WiFi 在应答，极易误判。
+复位手段是 UDC 软件拔插（`soft_connect` 写 `disconnect` 再写 `connect`），
+不需要重启、不需要动 PHY，更不能用 `unbind musb-sprd`（实测直接导致内核重启）。
+
+- `/usr/sbin/e5-usb-recover`：软件拔插 + 必要的 UDC 补绑 + `usb0` 入桥，遵守厂商 watch 的
+  `/tmp/run/e5-usb-reset/lock` 互斥锁。
+- `/etc/init.d/e5-usb-guard`（S99/K10，默认启用）+ `/usr/sbin/e5-usb-guard-check`：开机 25 s
+  自检，只在插线且状态不对或 ping 不通主机时动手，失败不影响系统。厂商 `e5-usb-watch`
+  在 `configured` 时直接跳过，两者互补而非重复。
+- `/root/pm-test.sh`：过夜功耗测试，采样直接写 `/root` 并定期 sync，不依赖 tmpfs；
+  测试开跑时临时停掉三个常驻唤醒源（`e5-powersam` / `powermon` / cron `rebind.sh`），
+  结束或异常退出自动恢复，开机还有一次 crontab 标记回滚兜底。
+
+源件放 `/etc/e5/usb/`，由 `/etc/e5/power/install.sh` 第 4 段在开机（S19 自愈链）铺回
+`/usr/sbin`、`/etc/init.d` 与 `/root`；`backup-e5.sh` 补齐了对应抓取项与 md5 校验。
+**v1.0.7 的缺口**：这 4 个文件当时只在设备上，升级后 `S99e5-usb-guard` 会指向空文件。
+
+### 修订：功耗测量口径
+
+`battery/charge_counter` 在这台设备上恒为 1（无效属性），`battery/capacity` 与
+`sc27xx-fgu/capacity` 都会因 OCV 重算瞬间跳变（实测 100%→43%、39.6%→87.9%）。
+一律改用内核 `sprd-fgu` 打印的累计库仑计 `cc_mah` 做差分，且只在同一次连续开机区间内有效。
+测试脚本 v3/v4 已按此改；v1.0.7 README 里"平均电流未测"的说法同步更新为
+8 小时实机约 **41 mA / 167 mW**（B 级，待过夜复核）。
+
 ## 1.0.7 — 2026-11-08
 
 ### 新增：熄屏深睡守护（默认启用）

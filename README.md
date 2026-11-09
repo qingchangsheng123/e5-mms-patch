@@ -174,9 +174,34 @@ cat /root/e5-deepsleep.log               # 每轮 slept / ovh / nap / 唤醒源
 90 分钟实机窗口（未插线、wlan0 down、日志写 tmpfs）：107 轮、占空比 94.42%、挂起失败 0，
 唤醒源 100% `pscp-5:smsg-5-6`。剔除 >60 s 的长睡轮后短睡段占空比 74.97%。
 
-**真实平均电流尚未测出**：此前用 `charge_counter` 差分算出的 10.27 mA / 12.5 天已作废 ——
-该值是电量计按开路电压估算的 0.1% 步进值，拔线后回落到稳态点就不再变化，不是库仑计。
-需要过夜稳定段或外部电流表重测。另有一次 `time.sleep(0.5)` 被拉长到 3 s 的 AP 侧调度问题在查。
+**平均电流约 41 mA / 167 mW（B 级，待过夜复核）**：按 `cc_mah` 连续 7.7 h 下降 317 mAh 估算。
+`charge_counter` 在本机恒为 1（无效属性）；`battery/capacity` 与 `sc27xx-fgu/capacity`
+都会因开路电压重算**瞬间跳变**（实测 100%→43%、39.6%→87.9%），不能用来算放电量。
+早先用 `charge_counter` 差分得到的 10.27 mA / 12.5 天已作废。
+若复核后仍是 40 mA 量级，说明深睡只压住了 AP，CP/modem 常开才是主要耗电源。
+另有一次 `time.sleep(0.5)` 被拉长到 3 s 的 AP 侧调度问题在查。
+
+## USB 数据面卡死的自愈（v1.0.8）
+
+故障特征很有迷惑性：设备侧 UDC `state=configured`、`usb0` UP、`carrier=1`，Windows 侧
+「以太网 3」也已连接且有 IP，但 **`usb0` 的收发计数完全不动**。此时 ping 看着能通，是因为
+USB 与 WiFi 同在 `192.168.9.0/24`，Windows 挑了 WiFi 应答；TCP/ssh 才暴露真相。
+
+判定与恢复：
+
+```sh
+cat /sys/class/net/usb0/statistics/rx_packets   # 打几个包后计数不动 = 数据面卡死
+/usr/sbin/e5-usb-recover                        # UDC 软件拔插，约 6 s 后恢复
+/usr/sbin/e5-usb-recover status                 # 只读体检，不动硬件
+```
+
+底层动作是 `soft_connect` 写 `disconnect` 再写 `connect`，主机重新枚举，不必重启设备。
+**严禁 `echo 64a00000.usb > /sys/bus/platform/drivers/musb-sprd/unbind`**：实测会直接触发
+内核重启。开机自检 `e5-usb-guard`（S99）在插线且状态异常或 ping 不通主机时自动调用恢复工具。
+
+源件在 `/etc/e5/usb/`，由 `/etc/e5/power/install.sh` 第 4 段随 S19 自愈链铺回，
+固件升级不会丢。`/root/pm-test.sh` 是过夜功耗测试脚本（一次性用途），测试期间会临时
+停掉三个周期性唤醒源并在结束时恢复。
 
 ## 省电：按需蜂窝数据
 
@@ -274,11 +299,15 @@ files/
   backfill.py           历史乱码彩信回填
   install-core.sh       核心安装逻辑（装成 /etc/e5/mms/install.sh）
   e5-mms.init           开机自愈服务
-  power-install.sh      省电扩展自愈安装（含深睡守护）
+  power-install.sh      省电扩展自愈安装（含深睡守护 + USB 自愈，共 5 段）
   powersave.sh          省电开关 / WiFi 手动开关
   e5-deepsleep          深睡守护（Python）
   e5-deepsleep.init     深睡守护 procd 服务
   data-ondemand.sh      按需蜂窝数据
+  e5-usb-recover        USB gadget 软件拔插复位
+  e5-usb-guard-check    开机自检逻辑
+  e5-usb-guard.init     开机自检服务（S99/K10）
+  pm-test.sh            过夜功耗测试（源件放 /etc/e5/usb/，装到 /root）
 ```
 
 ## 打包分发
@@ -296,7 +325,10 @@ sh package.sh
 - 只支持单个 modem 实例（`Modem/0`）。
 - 深睡守护的真实平均功耗未测（见上节），短睡段仍被 CP `smsg-5-6` 高频簇打断，约 8-10 s 醒一次；
   静默期可连睡 600 s，整轮占空比取决于两种状态的占比。
-- 开热点会断开 USB RNDIS；深睡期间 SSH 不可达，调试请插线或用串口。
+- 开热点会断开 USB RNDIS；若数据面卡死，用 `/usr/sbin/e5-usb-recover` 软件拔插恢复，
+  不要 `unbind musb-sprd`。深睡期间 SSH 不可达，调试请插线或用串口。
+- 主机同时连着 USB 与 `E5-OpenWrt` 热点时，两者同在 `192.168.9.0/24`，Windows 按接口度量
+  选路；判 USB 是否真的通，必须看 `usb0` 计数增量或做 TCP 连接，不能只看 ping。
 
 ## 许可
 

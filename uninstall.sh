@@ -41,6 +41,13 @@ rm -f /etc/init.d/e5-mms
 rm -f /usr/bin/e5-forward
 echo "已停用开机自愈服务 e5-mms"
 
+# v1.0.8 USB gadget 自愈：停开机自检，源件保留在 /etc/e5/usb 便于以后重装
+if [ -x /etc/init.d/e5-usb-guard ]; then
+	/etc/init.d/e5-usb-guard disable >/dev/null 2>&1 || true
+	rm -f /etc/init.d/e5-usb-guard
+	echo "已停用 USB 开机自检（源件与工具保留）"
+fi
+
 # v1.0.7 深睡守护（procd respawn，停服务要用 ubus 删实例，pkill 追不上）
 if [ -x /etc/init.d/e5-deepsleep ]; then
 	/etc/init.d/e5-deepsleep stop >/dev/null 2>&1 || true

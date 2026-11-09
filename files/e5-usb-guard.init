@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+# e5-usb-guard —— 开机自检 USB gadget（逻辑在 /usr/sbin/e5-usb-guard-check）
+# 只在上电后跑一次，不动任何常驻服务，失败也不影响系统。
+
+START=99
+STOP=10
+USE_PROCD=0
+
+start() {
+	start-stop-daemon -S -b -x /usr/sbin/e5-usb-guard-check
+}
+
+stop() {
+	:
+}

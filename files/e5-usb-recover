@@ -1,0 +1,64 @@
+#!/bin/sh
+# e5-usb-recover —— 在 OpenWrt 侧重置 USB gadget / RNDIS 数据通路
+#
+# 背景：某些操作（例如主机侧 NDIS 重置中断、UDC 手写配置、驱动 rebind）之后，
+#       musb 显示 configured、usb0 UP、carrier=1，但数据面完全不通（收发计数不动）。
+#       此时不需要重启，也不需要动 PHY：对 UDC 写一次 disconnect/connect
+#       就是一次"软件拔插"，主机重新枚举后数据面立即恢复（实测 2026-11-09）。
+#
+# 注意：厂商常驻的 /opt/e5/usb-watch.sh 只处理 state != configured；
+#       state=configured 但数据面卡死是它的盲区，所以本工具与它是互补而非重复。
+#       watch 约定手工 reset 期间要持有 /tmp/run/e5-usb-reset/lock，这里遵守，
+#       避免两边并发写 soft_connect。
+#
+# 用法：e5-usb-recover          执行一次重置
+#       e5-usb-recover status   只看状态
+
+G=/sys/kernel/config/usb_gadget/linux
+U=/sys/class/udc/musb-hdrc.1.auto
+LOCKDIR=/tmp/run/e5-usb-reset
+LOCK=$LOCKDIR/lock
+
+status() {
+	echo "udc_state=$(cat $U/state 2>/dev/null)"
+	echo "cfgfs_udc=$(cat $G/UDC 2>/dev/null)"
+	echo "usb0=$(ip -br link show usb0 2>/dev/null | awk '{print $2}') carrier=$(cat /sys/class/net/usb0/carrier 2>/dev/null)"
+	echo "usb_online=$(cat /sys/class/power_supply/usb/online 2>/dev/null)"
+	echo "rx_pkts=$(cat /sys/class/net/usb0/statistics/rx_packets 2>/dev/null) tx_pkts=$(cat /sys/class/net/usb0/statistics/tx_packets 2>/dev/null)"
+}
+
+if [ "$1" = "status" ]; then
+	status
+	exit 0
+fi
+
+[ -d "$U" ] || { echo "没有 UDC，无法重置"; exit 1; }
+
+# 0. 与 e5-usb-watch 互斥（非 -p 的 mkdir 才是真正的原子锁）
+mkdir -p "$LOCKDIR" 2>/dev/null
+if ! mkdir "$LOCK" 2>/dev/null; then
+	echo "另一个 USB reset 正在进行（$LOCK 存在），本次跳过"
+	exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' 0
+
+# 1. configfs 属性的 stat 大小恒为 4096，即使用 [ -s ] 判断"内容非空"
+#    也永远为真（见 /root/rebind.sh 的注释，2026-11-07 实测）。必须读内容。
+if [ -z "$(cat "$G/UDC" 2>/dev/null)" ]; then
+	echo musb-hdrc.1.auto >"$G/UDC" 2>/dev/null
+	sleep 1
+	echo "已重新绑定 UDC"
+fi
+
+# 2. 软件拔插
+echo disconnect >"$U/soft_connect" 2>/dev/null || { echo "disconnect 写入失败"; exit 1; }
+sleep 2
+echo connect >"$U/soft_connect" 2>/dev/null || { echo "connect 写入失败"; exit 1; }
+sleep 3
+
+# 3. 网卡没在桥上就补回去
+if ip link show usb0 >/dev/null 2>&1; then
+	ip link set usb0 up 2>/dev/null
+	[ -d /sys/class/net/br-lan/brif/usb0 ] || ip link set usb0 master br-lan 2>/dev/null
+fi
+status

@@ -95,8 +95,14 @@ if [ -f "$SRCDIR/files/powersave.sh" ] && [ -f "$SRCDIR/files/data-ondemand.sh" 
 	# v1.0.7：深睡守护的源件必须先就位，install.sh 第 3 段才会铺回 /usr/sbin 并建自启
 	cp "$SRCDIR/files/e5-deepsleep" /etc/e5/power/e5-deepsleep && chmod 755 /etc/e5/power/e5-deepsleep
 	cp "$SRCDIR/files/e5-deepsleep.init" /etc/e5/power/e5-deepsleep.init && chmod 755 /etc/e5/power/e5-deepsleep.init
+	# v1.0.8：USB gadget 自愈工具的源件放 /etc/e5/usb/（/etc 升级不清、整目录进备份包），
+	# 由 power/install.sh 第 4 段铺回 /usr/sbin 与 /etc/init.d 并建 S99 自启。
+	mkdir -p /etc/e5/usb || true
+	for f in e5-usb-recover e5-usb-guard-check e5-usb-guard.init pm-test.sh; do
+		cp "$SRCDIR/files/$f" "/etc/e5/usb/$f" && chmod 755 "/etc/e5/usb/$f"
+	done
 	sh /etc/e5/power/install.sh >/dev/null 2>&1 || true
-	say "省电扩展已就位（按需拨号、开机省电、深睡守护）"
+	say "省电扩展已就位（按需拨号、开机省电、深睡守护、USB 自愈）"
 fi
 
 # 开机自愈：系统升级会覆盖 /usr 下的东西，靠这个 S19 服务补回来

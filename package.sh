@@ -17,6 +17,8 @@ chmod 755 "$OUT/$NAME/install.sh" "$OUT/$NAME/uninstall.sh"
 chmod 755 "$OUT/$NAME/files/"*.sh "$OUT/$NAME/files/"*.py
 chmod 755 "$OUT/$NAME/files/e5-mms.init"
 chmod 755 "$OUT/$NAME/files/e5-deepsleep" "$OUT/$NAME/files/e5-deepsleep.init"
+chmod 755 "$OUT/$NAME/files/e5-usb-recover" "$OUT/$NAME/files/e5-usb-guard-check" \
+         "$OUT/$NAME/files/e5-usb-guard.init"
 
 tar -czf "$OUT/$NAME.tar.gz" -C "$OUT" "$NAME"
 (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
