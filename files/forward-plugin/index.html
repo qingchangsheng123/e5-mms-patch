@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<style>
+	html, body { margin: 0; background: #0b0e13; color: #e8ecf2;
+		font-family: "Noto Sans CJK SC", "DejaVu Sans", sans-serif; user-select: none; cursor: none; }
+	*, *::before, *::after { box-sizing: border-box; }
+	body { padding: 8px; }
+	.card { background: #161b23; border-radius: 10px; padding: 9px 11px; margin-bottom: 7px; }
+	.row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+	/* 目标主机名可以很长，右侧状态不能被挤掉或裁掉 */
+	.row > :first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.row > :last-child { flex: 0 0 auto; white-space: nowrap; }
+	.name { font-weight: bold; }
+	.sub { color: #8b95a5; font-size: 12px; }
+	.on { color: #3ccf7a; } .off { color: #f2c14b; } .bad { color: #f0625a; }
+	button { font: inherit; color: #e8ecf2; background: #232a35; border: 0; border-radius: 8px;
+		padding: 9px; width: 100%; outline: none; margin-bottom: 6px; text-align: left; }
+	button.sel { box-shadow: 0 0 0 2px #fff; }
+	.item { display: flex; justify-content: space-between; font-size: 12px;
+		padding: 3px 0; border-top: 1px solid #222833; }
+	.item:first-child { border-top: 0; }
+</style>
+</head>
+<body>
+<div class="card">
+	<div class="row"><span class="name" id="title">短信转发</span><span id="state" class="sub">--</span></div>
+	<div class="row sub" style="margin-top:4px"><span id="target">--</span><span id="queue"></span></div>
+</div>
+<button id="b-toggle">--</button>
+<button id="b-test">--</button>
+<button id="b-retry">--</button>
+<div class="card">
+	<div class="sub" id="recent-title" style="margin-bottom:4px">最近投递</div>
+	<div id="list"></div>
+</div>
+<script src="/sdk/e5.js"></script>
+<script>
+'use strict';
+// 这页只是 sms-forward 的状态视图：开关走 POST /toggle（后端整体回写配置），
+// 队列与投递记录只读。发送/重试都交给后台，页面不阻塞。
+const $ = (id) => document.getElementById(id);
+const ACTIONS = ['b-toggle', 'b-test', 'b-retry'];
+let st = null, busy = false, sel = 0, timer = null;
+
+const T = {
+	title: { zh: '短信转发', en: 'SMS forward' },
+	on: { zh: '已开启', en: 'On' },
+	off: { zh: '已关闭', en: 'Off' },
+	loading: { zh: '读取中', en: 'Loading' },
+	unavailable: { zh: '不可用', en: 'Unavailable' },
+	noTarget: { zh: '未设置目标', en: 'No target' },
+	queue: { zh: '队列', en: 'Queue' },
+	turnOff: { zh: '关闭转发', en: 'Turn off' },
+	turnOn: { zh: '开启转发', en: 'Turn on' },
+	test: { zh: '测试发送', en: 'Send a test' },
+	retry: { zh: '重试队列', en: 'Retry queue' },
+	recent: { zh: '最近投递', en: 'Recent deliveries' },
+	none: { zh: '暂无记录', en: 'Nothing yet' },
+	testing: { zh: '已开始测试发送', en: 'Test send started' },
+	retrying: { zh: '已开始重试队列', en: 'Queue retry started' },
+	failed: { zh: '失败', en: 'Failed' },
+	toggling: { zh: '切换失败', en: 'Toggle failed' }
+};
+const t = (k) => e5.t(T[k]);
+
+function esc(s) {
+	return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function paintSel() {
+	ACTIONS.forEach((id, i) => $(id).classList.toggle('sel', i == sel));
+}
+
+function draw() {
+	$('title').textContent = t('title');
+	$('recent-title').textContent = t('recent');
+	$('b-test').textContent = t('test');
+	$('b-retry').textContent = t('retry');
+	if (!st || st.ok !== true) {
+		$('state').textContent = st?.error ?? t('unavailable');
+		$('state').className = 'sub bad';
+		$('b-toggle').textContent = t('turnOn');
+		return;
+	}
+	$('state').textContent = st.enabled ? t('on') : t('off');
+	$('state').className = 'sub ' + (st.enabled ? 'on' : 'off');
+	$('target').textContent = st.target ?? t('noTarget');
+	$('queue').textContent = `${t('queue')} ${st.queue.pending}/${st.queue.limit}`;
+	$('b-toggle').textContent = st.enabled ? t('turnOff') : t('turnOn');
+	if (st.log?.length) {
+		$('list').innerHTML = st.log.map((x) => `<div class="item"><span>${esc(x)}</span></div>`).join('');
+	} else {
+		$('list').innerHTML = st.recent.length ? st.recent.map((r) => {
+			const cls = r.result == 'sent' ? 'on' : 'bad';
+			return `<div class="item"><span>${esc((e5.time(r.time * 1000) ?? '').slice(0, 5))}</span>` +
+				`<span class="${cls}">${esc(r.label)}</span></div>`;
+		}).join('') : `<div class="sub">${t('none')}</div>`;
+	}
+}
+
+async function refresh() {
+	try { st = await e5.api('/status'); } catch (e) { st = { ok: false, error: e.message }; }
+	draw();
+}
+
+async function run(which) {
+	if (busy) return;
+	busy = true;
+	e5.keepAwake(true);
+	try {
+		if (which == 'b-toggle') {
+			st = await e5.api('/toggle', { body: { on: !st.enabled } });
+			if (st.ok !== true) e5.toast(st.error ?? t('toggling'));
+		} else if (which == 'b-test') {
+			const r = await e5.api('/test', { body: {} });
+			e5.toast(r.ok ? t('testing') : (r.error ?? t('failed')));
+			await new Promise((r2) => setTimeout(r2, 2500));
+			await refresh();
+		} else {
+			await e5.api('/retry', { body: {} });
+			e5.toast(t('retrying'));
+			await new Promise((r2) => setTimeout(r2, 2000));
+			await refresh();
+		}
+	} catch (e) {
+		e5.toast(e.message);
+	}
+	e5.keepAwake(false);
+	busy = false;
+	draw();
+}
+
+ACTIONS.forEach((id, i) => {
+	$(id).addEventListener('click', () => { sel = i; paintSel(); run(id); });
+});
+
+e5.onKey((k) => {
+	if (k.kind == 'up') { sel = (sel + ACTIONS.length - 1) % ACTIONS.length; paintSel(); return true; }
+	if (k.kind == 'down') { sel = (sel + 1) % ACTIONS.length; paintSel(); return true; }
+	if (k.kind == 'ok') { $(ACTIONS[sel]).click(); return true; }
+	return false;
+});
+
+paintSel();
+$('b-toggle').textContent = t('turnOn');
+$('b-test').textContent = t('test');
+$('b-retry').textContent = t('retry');
+$('state').textContent = t('loading');
+refresh();
+timer = setInterval(() => { if (document.visibilityState != 'hidden') refresh(); }, 5000);
+window.addEventListener('pagehide', () => clearInterval(timer));
+</script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 E5（Unisoc UMS9621）随身路由刷 e5-sleep 系列 OpenWrt 后，用来做**纯短信盒子**的用户空间补丁：
 只收短信、转发到手机，不开热点、不做文件共享或代理。不碰内核、不动固件分区，配置和源件全在
 `/etc/e5`（跨升级保留），由 S19 开机自愈链铺回被升级覆盖的 `/usr` 文件，卸载可完整回滚。
-当前版本 **v1.0.8**。
+当前版本 **v1.0.9**。
 
 一句话概括：把一台待机 600-900mW 乱跳、彩信显示乱码、转发丢消息、升级就失效的随身路由，
 改成端到端 7 秒推送、能熄屏深睡、能自愈的短信网关。
@@ -19,8 +19,10 @@ E5（Unisoc UMS9621）随身路由刷 e5-sleep 系列 OpenWrt 后，用来做**�
 | 5 | USB RNDIS 数据面卡死：UDC 显示 `configured` 但 `usb0` 计数不动，ping 走 WiFi 是假象 | `e5-usb-recover` 软件拔插 + S99 开机自检；严禁 `unbind musb-sprd`（会触发内核重启） |
 | 6 | `/usr` 升级即被覆盖；Android 与 OpenWrt 的短信各存一份、互不可见 | `/etc/e5` 保留源件 + 开机自愈；`e5-sms-sync` 双向同步 `inbox.json` 与 `mmssms.db` |
 
-功耗读数口径：317-325mW 是**醒着瞬时**值；平均电流按 dmesg `cc_mah` 差分估算约 41 mA / 167 mW，
-属待过夜复核的推断。`charge_counter` 恒为 1、各 `capacity` 属性会因 OCV 重算瞬跳，均不能用来算放电量。
+功耗读数口径：317-325mW 是**醒着瞬时**值；平均电流按 dmesg `cc_mah` 对 wall 时间做线性回归
+（本机唯一不跳变的量）：11-10 白天 4.90 h **21.44 mA / 82.6 mW**（续航 6.0 天，占空比 98.8%），
+11-09 夜 12.69 h **39.07 mA / 151.8 mW**（3.3 天），其中 21:30 之后稳定在 40.4 mA。
+`charge_counter` 恒为 1、各 `capacity` 属性会因 OCV 重算瞬跳，均不能用来算放电量。
 
 安装、验证、卸载与各模块细节见下文。
 
@@ -71,7 +73,19 @@ files/power-install.sh   ->  /etc/e5/power/install.sh
 files/powersave.sh       ->  /etc/e5/power/powersave.sh
 files/e5-deepsleep       ->  /etc/e5/power/e5-deepsleep      （源件，自愈时铺回 /usr/sbin）
 files/e5-deepsleep.init  ->  /etc/e5/power/e5-deepsleep.init （源件，自愈时铺回 /etc/init.d）
+files/e5-usb-*           ->  /etc/e5/usb/                    （源件，自愈时铺回 /usr/sbin）
 ```
+
+双系统短信同步（v1.0.9 起随包分发，以前只在本机手工部署）：
+
+```
+files/sms-sync/sms-sync.py       ->  /etc/e5/sms-sync/sms-sync.py
+files/sms-sync/install.sh        ->  /etc/e5/sms-sync/install.sh
+files/sms-sync/e5-sms-sync.init  ->  /etc/e5/sms-sync/e5-sms-sync.init
+files/sms-sync/uninstall.sh      ->  /etc/e5/sms-sync/uninstall.sh
+```
+
+自愈链会执行 `/etc/e5/sms-sync/install.sh`，由它建 S99 服务、写 `*/2` 的 cron、链出 `/usr/bin/e5-sms-sync`。
 
 然后核心安装逻辑会：
 
@@ -118,8 +132,8 @@ python3 /etc/e5/mms/backfill.py          # 真正写回
 # 解码器是否已替换（应输出 MMS_PUSH_PORTS）
 grep -c MMS_PUSH_PORTS /usr/lib/e5/sms_pdu.py
 
-# 转发补丁是否已打（应输出 e5-forward-queue-v1）
-grep -c 'e5-forward-queue-v1' /usr/libexec/unisoc-modem/sms-forward
+# 转发补丁是否已打（应输出 e5-forward-queue-v3）
+grep -c 'e5-forward-queue-v3' /usr/libexec/unisoc-modem/sms-forward
 
 # 队列状态 / 投递记录
 e5-forward status
@@ -142,15 +156,18 @@ cat /etc/e5/mms/boot.log
 sh uninstall.sh
 ```
 
-会还原两个原始文件、停用 `e5-mms` 开机服务、重开短信接收进程。`/etc/e5/mms` 下的备份和待重发队列不会删，确认无误后可手动 `rm -rf /etc/e5/mms`。
+会还原两个原始文件，停用 `e5-mms` / `e5-usb-guard` / `e5-deepsleep` / `e5-data-ondemand` /
+`e5-powersave` / `e5-sms-sync` 的开机自启，撤掉 sms-sync 的 cron，重开短信接收进程。
+v1.0.9 起还会先执行 `powersave.sh off` 把热点、蓝牙、音频的 rc.d 链接与 uci 恢复原厂，
+并挂断按需数据（PDP 不会留在连接态白耗电）。`/etc/e5/mms` 下的备份和待重发队列不会删，
+确认无误后可手动 `rm -rf /etc/e5/mms`。
 
-省电扩展独立，单独回滚：
+只想临时关掉省电扩展、不回滚文件：
 
 ```sh
-/etc/init.d/e5-data-ondemand stop && /etc/init.d/e5-data-ondemand disable
-/etc/init.d/e5-powersave stop && /etc/init.d/e5-powersave disable
-/etc/e5/power/powersave.sh off     # 恢复热点与蓝牙音频
-/etc/init.d/e5-deepsleep stop && /etc/init.d/e5-deepsleep disable
+/etc/init.d/e5-data-ondemand stop    # 停守护并按 stop_service 语义挂断数据
+/etc/init.d/e5-powersave stop        # 等价于 powersave.sh off，恢复热点/蓝牙/音频
+/etc/init.d/e5-deepsleep stop
 ```
 
 ## 熄屏深睡守护（v1.0.7）
@@ -182,15 +199,31 @@ cat /root/e5-deepsleep.log               # 每轮 slept / ovh / nap / 唤醒源
 > 需要远程调试时，开热点后主机连接 `E5-OpenWrt` 会拿到 `192.168.9.100`，可直接 SSH 到
 > `192.168.9.1`（USB 通道不通时的备用路径）。
 
-90 分钟实机窗口（未插线、wlan0 down、日志写 tmpfs）：107 轮、占空比 94.42%、挂起失败 0，
-唤醒源 100% `pscp-5:smsg-5-6`。剔除 >60 s 的长睡轮后短睡段占空比 74.97%。
+**实测平均电流（A 级，`cc_mah` 对 wall 时间线性回归）**
 
-**平均电流约 41 mA / 167 mW（B 级，待过夜复核）**：按 `cc_mah` 连续 7.7 h 下降 317 mAh 估算。
+| 窗口 | 时长 | 平均电流 | 功率 | 续航(3082mAh) | 占空比 |
+|---|---|---|---|---|---|
+| 11-10 白天 12:04–16:58 | 4.90 h | **21.44 mA** | 82.6 mW | 6.0 天 | 98.8% |
+| 11-09 白天 12:03–17:05 | 5.04 h | 22.85 mA | 90.3 mW | 5.6 天 | 96.5% |
+| 11-09 19:26–21:30 | 2.07 h | **21.95 mA** | 86.4 mW | 5.9 天 | — |
+| 11-09 21:30–08:07 | 10.62 h | **40.44 mA** | 156.3 mW | 3.2 天 | — |
+| 11-09 过夜全程 | 12.69 h | **39.07 mA** | 151.8 mW | 3.3 天 | 98.97% |
+
+同一台设备白天 22 mA、入夜 21:30 起稳定 40 mA，两个状态都可复现（11-08 夜测同样是 41 mA）。
+转折点与 CP 的 `smsg` 提前唤醒停止是同一轮次：唤醒源消失后每轮都顶到 `ED_RTC=600` 兜底，
+**唤醒次数下降而电流上升**，说明主耗电不是唤醒次数，而是 CP/modem 在无 smsg 时的驻留状态
+（B 级推断，尚未定位）。所以"深睡占空比 >90% 但仍有 20-40 mA"是常态，不是没睡。
+
 `charge_counter` 在本机恒为 1（无效属性）；`battery/capacity` 与 `sc27xx-fgu/capacity`
 都会因开路电压重算**瞬间跳变**（实测 100%→43%、39.6%→87.9%），不能用来算放电量。
 早先用 `charge_counter` 差分得到的 10.27 mA / 12.5 天已作废。
-若复核后仍是 40 mA 量级，说明深睡只压住了 AP，CP/modem 常开才是主要耗电源。
-另有一次 `time.sleep(0.5)` 被拉长到 3 s 的 AP 侧调度问题在查。
+
+**采样点被拉长的坑（v1.0.8 → v1.0.9 已修）**：挂起期间 `CLOCK_MONOTONIC` 不走，
+任何基于它的 `sleep` 都会在唤醒后一次性补齐长度 —— 这也是早先观察到
+"`time.sleep(0.5)` 被拉长到 3 s"的真实原因（不是 AP 调度问题）。`pm-test.sh` 原来
+`sleep 120` 采一个点，整夜被拉成 1069–5652 s、5 h 只采到 8 点；v5 改成 1 秒轮询 +
+`date +%s`（wall 时间，跨挂起照常走）闸门，12.7 h 采到 87 点、`maxgap` 614 s。
+脚本自己不再产生唤醒，只搭守护唤醒的便车，因此不增加功耗。
 
 ## USB 数据面卡死的自愈（v1.0.8）
 
@@ -316,10 +349,13 @@ files/
   e5-deepsleep          深睡守护（Python）
   e5-deepsleep.init     深睡守护 procd 服务
   data-ondemand.sh      按需蜂窝数据
+  e5-data-ondemand.init 按需数据的 procd 服务（S97/K12）
+  e5-powersave.init     开机应用省电（S98/K10）
   e5-usb-recover        USB gadget 软件拔插复位
-  e5-usb-guard-check    开机自检逻辑
+  e5-usb-guard-check    开机自检逻辑（按 usb0 rx 计数判定，不看 ping）
   e5-usb-guard.init     开机自检服务（S99/K10）
   pm-test.sh            过夜功耗测试 v5（源件放 /etc/e5/usb/，装到 /root）
+  sms-sync/             双系统短信同步：sms-sync.py / install.sh / init / uninstall.sh
 ```
 
 ## 打包分发
@@ -335,8 +371,8 @@ sh package.sh
 - 加密通知只有 URL，且该 URL 通常需要手机侧鉴权，直接打开多半失败。
 - 依赖上游 `sms_pdu.py` / `sms-forward` 的现有结构；固件大改版后 `patch-forward.py` 可能报"锚点对不上"，此时需要跟进适配。
 - 只支持单个 modem 实例（`Modem/0`）。
-- 深睡守护的真实平均功耗未测（见上节），短睡段仍被 CP `smsg-5-6` 高频簇打断，约 8-10 s 醒一次；
-  静默期可连睡 600 s，整轮占空比取决于两种状态的占比。
+- 深睡守护的实测平均电流见上节：白天 21.44 mA（v1.0.10，占空比 98.8%）、夜间 40.4 mA。
+  夜间那段的主耗电源还没定位，怀疑在 CP/modem 侧（B 级），不是 AP 唤醒次数。
 - 开热点会断开 USB RNDIS；若数据面卡死，用 `/usr/sbin/e5-usb-recover` 软件拔插恢复，
   不要 `unbind musb-sprd`。深睡期间 SSH 不可达，调试请插线或用串口。
 - 主机同时连着 USB 与 `E5-OpenWrt` 热点时，两者同在 `192.168.9.0/24`，Windows 按接口度量

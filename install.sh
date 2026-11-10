@@ -101,8 +101,63 @@ if [ -f "$SRCDIR/files/powersave.sh" ] && [ -f "$SRCDIR/files/data-ondemand.sh" 
 	for f in e5-usb-recover e5-usb-guard-check e5-usb-guard.init pm-test.sh; do
 		cp "$SRCDIR/files/$f" "/etc/e5/usb/$f" && chmod 755 "/etc/e5/usb/$f"
 	done
-	sh /etc/e5/power/install.sh >/dev/null 2>&1 || true
+	# 这里不再直接跑 power/install.sh：下面 install-core.sh 的扩展循环会跑一次，
+	# v1.0.8 及以前两处都跑，手动升级时 data-ondemand 与 deepsleep 各被 restart 两次。
 	say "省电扩展已就位（按需拨号、开机省电、深睡守护、USB 自愈）"
+fi
+
+# ---------- 双系统短信同步（v1.0.9 起随包分发）----------
+# 之前只在本机手工部署，发布包里没有这四件，全新安装拿不到「双系统短信互通」。
+# 源件放 /etc/e5/sms-sync（整目录进备份包），由 install-core.sh 的扩展循环执行它的 install.sh。
+if [ -f "$SRCDIR/files/sms-sync/sms-sync.py" ]; then
+	mkdir -p /etc/e5/sms-sync || true
+	for f in sms-sync.py install.sh e5-sms-sync.init uninstall.sh; do
+		cp "$SRCDIR/files/sms-sync/$f" "/etc/e5/sms-sync/$f" && chmod 755 "/etc/e5/sms-sync/$f"
+	done
+	say "短信同步源件已就位（/etc/e5/sms-sync，随包分发）"
+fi
+
+# ---------- 射频看门狗（v1.0.9 起随包分发）----------
+# 2026-11-10 事故：基带停在 CFUN=0（射频关闭），ModemManager 却报
+# registered/connected、运营商正常，短信一条都收不到。设备上原本有这套
+# e5-modem-guard，但没有 /etc/init.d 与 rc.d 链接、进程也不在，等于没有。
+# 源件放 /etc/e5/modem-guard（整目录进备份包），由 install-core.sh 扩展循环执行 install.sh。
+if [ -f "$SRCDIR/files/modem-guard/e5-modem-guard" ]; then
+	mkdir -p /etc/e5/modem-guard || true
+	for f in e5-modem-guard e5-modem-guard.init install.sh modem-guard.conf; do
+		cp "$SRCDIR/files/modem-guard/$f" "/etc/e5/modem-guard/$f" || true
+	done
+	chmod 755 /etc/e5/modem-guard/e5-modem-guard \
+	          /etc/e5/modem-guard/e5-modem-guard.init \
+	          /etc/e5/modem-guard/install.sh
+	chmod 644 /etc/e5/modem-guard/modem-guard.conf
+	say "射频看门狗源件已就位（/etc/e5/modem-guard）"
+fi
+
+# ---------- 信息屏：信号格修复 + 转发面板（v1.0.10 起随包分发）----------
+# 两个独立的问题：
+#   1. 熄屏时 t551m-sim-status 60 s 才刷一次快照，api.uc 只认 15 s，亮屏瞬间
+#      信号格与制式必然为空（5 秒后才回来），而 app.js 的兜底又被 quality:null
+#      堵死。patch-screen.py 让过期快照保留最后读数并标 stale，前端把它画成
+#      半透明而不是 0 格。
+#   2. transport.js 连的 8089 WebSocket 从来没有部署过，每次加载都在重连并刷
+#      console 错误，一并改成原生 fetch。
+# 补丁幂等：已打过的文件按 marker 跳过；原厂换版导致锚点对不上就原样不动。
+if [ -f "$SRCDIR/files/patch-screen.py" ]; then
+	cp "$SRCDIR/files/patch-screen.py" "$TARGET/patch-screen.py" && chmod 755 "$TARGET/patch-screen.py"
+	python3 "$TARGET/patch-screen.py" || say "信息屏补丁未完成，见上面的输出（原文件已备份在 /root/e5-backup/screen）"
+fi
+
+# 转发面板：只是 e5-forward 的状态视图，装在 /etc 下（升级不清），
+# plugin link 会把目录链到 web root；卸载只删目录，不动转发配置。
+if [ -f "$SRCDIR/files/forward-plugin/manifest.json" ]; then
+	FW=/etc/e5-infoscreen/plugins/forward
+	mkdir -p "$FW" || true
+	for f in manifest.json backend.uc index.html; do
+		cp "$SRCDIR/files/forward-plugin/$f" "$FW/$f" && chmod 644 "$FW/$f"
+	done
+	/usr/libexec/e5-infoscreen/plugin link >/dev/null 2>&1 || true
+	say "短信转发面板已就位（信息屏 → 应用 → 短信转发）"
 fi
 
 # 开机自愈：系统升级会覆盖 /usr 下的东西，靠这个 S19 服务补回来
@@ -118,6 +173,12 @@ if [ "$BACKFILL" = "1" ]; then
 	echo
 	say "回填历史乱码彩信…"
 	python3 "$TARGET/backfill.py" || say "回填失败，可稍后手动执行 python3 $TARGET/backfill.py"
+fi
+
+# 信息屏补丁与新面板要重载 uhttpd 的 ucode handler 才生效（屏幕会黑一下再回来）
+if [ -f "$TARGET/patch-screen.py" ] || [ -d /etc/e5-infoscreen/plugins/forward ]; then
+	say "重启信息屏以加载补丁（约 5 秒）…"
+	/etc/init.d/e5-infoscreen restart >/dev/null 2>&1 || true
 fi
 
 echo

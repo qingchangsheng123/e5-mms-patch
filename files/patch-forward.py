@@ -19,9 +19,9 @@ import sys
 
 TARGET = os.environ.get('E5_FORWARD_TARGET', '/usr/libexec/unisoc-modem/sms-forward')
 BACKUP = os.environ.get('E5_FORWARD_BACKUP', '/etc/e5/mms/sms-forward.orig')
-MARK = '# e5-forward-queue-v2'
+MARK = '# e5-forward-queue-v3'
 
-BLOCK = r'''# e5-forward-queue-v2: 投递失败进入队列，按退避重试（由 /etc/e5/mms 注入）
+BLOCK = r'''# e5-forward-queue-v3: 投递失败进入队列，按退避重试（由 /etc/e5/mms 注入）
 QUEUE=$BASE/queue
 DELIVERY_LOG=$BASE/delivery.log
 RETRY_LIMIT=${MU300_FORWARD_RETRY_LIMIT:-7}
@@ -50,7 +50,14 @@ enqueue_retry() { # kind, from, text, date —— 调用方已持有 state.lock
     retryable "$DELIVER_RESULT" || return 1
     ensure_base || return 1
     mkdir -p "$QUEUE" && chmod 700 "$QUEUE" || return 1
-    _qid="$(date +%s).$$"
+    # 队列 ID 必须唯一：同一秒里两条短信（双卡并发、运营商补发）用「秒.$$」会撞名，
+    # 后写的一条把前一条覆盖掉，等于丢消息。撞了就加序号，直到名字不存在。
+    _qn=0
+    while :; do
+        _qid="$(date +%s).$$.$_qn"
+        [ -e "$QUEUE/$_qid" ] || break
+        _qn=$((_qn + 1))
+    done
     json_init
     json_add_string kind "$1"
     json_add_string from "$2"
@@ -60,7 +67,10 @@ enqueue_retry() { # kind, from, text, date —— 调用方已持有 state.lock
     json_add_int card "${MU300_SIM_SLOT:-0}"
     json_add_int attempts 1
     json_add_int next "$(( $(date +%s) + $(retry_delay 1) ))"
-    json_dump > "$QUEUE/.$_qid.tmp" && mv -f "$QUEUE/.$_qid.tmp" "$QUEUE/$_qid" || return 1
+    # 临时文件用隐藏名：qlen/queue_report 的 glob 不匹配点开头的文件，
+    # 写到一半的条目不会被当成待发消息，也不会让按需拨号误判队列非空。
+    json_dump > "$QUEUE/.$_qid.tmp" && mv -f "$QUEUE/.$_qid.tmp" "$QUEUE/$_qid" \
+        || { rm -f "$QUEUE/.$_qid.tmp"; return 1; }
     queue_log "排队重试 id=$_qid 原因=$DELIVER_RESULT 计划 $RETRY_LIMIT 次"
 }
 drain_queue() { # 每轮只补一条，避免长时间占着 state.lock 挡住新短信
@@ -108,7 +118,9 @@ drain_queue() { # 每轮只补一条，避免长时间占着 state.lock 挡住�
                 json_add_int card "$_qslot"
                 json_add_int attempts "$attempts"
                 json_add_int next "$(( _qnow + $(retry_delay "$attempts") ))"
-                json_dump > "$_qfile.tmp.$$" && mv -f "$_qfile.tmp.$$" "$_qfile"
+                # 同样用隐藏临时名，避免被其他进程的 glob 当成一条待发消息读到半截
+                _qtmp="$(dirname "$_qfile")/.$(basename "$_qfile").tmp.$$"
+                json_dump > "$_qtmp" && mv -f "$_qtmp" "$_qfile" || rm -f "$_qtmp"
                 queue_log "补发失败 第$attempts次 原因=$DELIVER_RESULT 稍后再试 $(basename "$_qfile")"
             fi
         fi

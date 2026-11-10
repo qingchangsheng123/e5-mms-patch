@@ -2,12 +2,19 @@
 # e5-usb-guard-check —— 开机后自检 USB gadget，卡死就软件插拔一次
 #
 # 定位：厂商 /opt/e5/usb-watch.sh 常驻，但它在 state=configured 时直接跳过，
-#       处理不了"configured 但 usb0 收发计数不动"的数据面卡死。本自检用
-#       设备侧 ping 主机补这个缺口；两者通过 e5-usb-recover 的 lock 互斥。
+#       处理不了"configured 但 usb0 收发计数不动"的数据面卡死。本自检补这个缺口；
+#       两者通过 e5-usb-recover 的 lock 互斥。
 #
-# 触发条件（同时满足才动手）：
-#   usb/online = 1（线插着、有 VBUS）
-#   且 UDC state != configured（连续两次确认），或 configured 但 ping 不通主机
+# 触发条件：
+#   usb/online = 1（线插着、有 VBUS），且满足其一
+#     - UDC state != configured（连续两次确认）
+#     - configured 但 carrier=0
+#     - configured 且 carrier=1，但 usb0 的 rx 计数在两次探测间不增长
+#
+# 判据为什么不用 ping（v1.0.9 改）：设备与 PC 同网段时，路由会经 wlan 把包送出去，
+# ping 通只证明"WiFi 通"，恰恰会掩盖 USB 数据面已死 —— 与项目铁律「同网段 ping
+# 走 WiFi 是假象」冲突。usb0 的 rx_packets 是内核计数，只有主机真的把包送到
+# RNDIS 才会涨，不会被选路骗过。主机完全静默时最多多插拔一次，代价 5 秒。
 #
 # 由 /etc/init.d/e5-usb-guard 用 start-stop-daemon -b 拉起（脱离会话）。
 # 也可以手工前台跑：GUARD_DELAY=0 e5-usb-guard-check
@@ -16,6 +23,27 @@ HOST=${GUARD_HOST:-192.168.9.2}
 DELAY=${GUARD_DELAY:-25}
 UDC=/sys/class/udc/musb-hdrc.1.auto
 ONLINE=/sys/class/power_supply/usb/online
+STAT=/sys/class/net/usb0/statistics
+CARRIER=/sys/class/net/usb0/carrier
+
+probe_rx() { cat "$STAT/rx_packets" 2>/dev/null; }
+probe_tx() { cat "$STAT/tx_packets" 2>/dev/null; }
+
+# 在 $1 秒内 rx 计数是否增长（数字不可比时按"没动"处理，宁可多插拔一次）
+rx_alive() {
+	_r0=$(probe_rx)
+	[ -n "$_r0" ] || return 1
+	sleep "$1"
+	_r1=$(probe_rx)
+	[ -n "$_r1" ] || return 1
+	[ "$_r1" -gt "$_r0" ] 2>/dev/null
+}
+
+recover() {
+	logger -t e5-usb-guard "$1 -> recover (state=$(cat "$UDC/state" 2>/dev/null) carrier=$(cat "$CARRIER" 2>/dev/null) rx=$(probe_rx) tx=$(probe_tx))"
+	/usr/sbin/e5-usb-recover >/dev/null 2>&1
+	sleep 6
+}
 
 sleep "$DELAY"
 
@@ -34,28 +62,29 @@ if [ "$st" != "configured" ]; then
 		logger -t e5-usb-guard "state recovered by watch: $st, nothing to do"
 		exit 0
 	fi
-	logger -t e5-usb-guard "state=$st (2nd check) -> recover"
-	/usr/sbin/e5-usb-recover >/dev/null 2>&1
-	sleep 6
+	recover "state=$st (2nd check)"
 else
-	# 主机可能还没起来，连续两次失败才判定数据面卡死
-	if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
-		logger -t e5-usb-guard "state=configured ping=$HOST ok, nothing to do"
-		exit 0
+	# configured，但链路没载波同样算卡死
+	if [ "$(cat "$CARRIER" 2>/dev/null)" != "1" ]; then
+		recover "state=configured carrier=0"
+	else
+		if rx_alive 8; then
+			logger -t e5-usb-guard "state=configured rx advancing, nothing to do"
+			exit 0
+		fi
+		# 6 秒内一个包都没收到：可能是主机静默。主动制造一次流量，再看 rx。
+		ping -c 2 -W 2 "$HOST" >/dev/null 2>&1
+		if rx_alive 8; then
+			logger -t e5-usb-guard "state=configured rx advancing after probe, nothing to do"
+			exit 0
+		fi
+		recover "state=configured rx frozen (rx=$(probe_rx) tx=$(probe_tx))"
 	fi
-	sleep 4
-	if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
-		logger -t e5-usb-guard "state=configured ping=$HOST ok (2nd try), nothing to do"
-		exit 0
-	fi
-	logger -t e5-usb-guard "state=configured but ping $HOST failed twice -> recover"
-	/usr/sbin/e5-usb-recover >/dev/null 2>&1
-	sleep 6
 fi
 
 st=$(cat "$UDC/state" 2>/dev/null)
-if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
-	logger -t e5-usb-guard "after recover: state=$st ping=ok"
+if rx_alive 8; then
+	logger -t e5-usb-guard "after recover: state=$st rx=ok"
 else
-	logger -t e5-usb-guard "after recover: state=$st ping=fail"
+	logger -t e5-usb-guard "after recover: state=$st rx=frozen (rx=$(probe_rx) tx=$(probe_tx))"
 fi

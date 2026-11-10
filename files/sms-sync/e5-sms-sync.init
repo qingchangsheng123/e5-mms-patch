@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+# E5 OpenWrt <-> Android SMS sync.
+# Runs once in the background at boot; cron keeps it incremental afterwards.
+# The task itself is one-shot, so there is nothing to stop.
+
+START=99
+STOP=10
+
+PROG=/etc/e5/sms-sync/sms-sync.py
+PY=/usr/bin/python3
+
+start() {
+	# 等存储和短信服务就绪，再让开；不阻塞启动流程
+	setsid /bin/sh -c "sleep 10; $PY $PROG run" >/dev/null 2>&1 &
+}
+
+stop() {
+	:
+}
+
+status() {
+	$PY $PROG status
+}

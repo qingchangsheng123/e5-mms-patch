@@ -37,8 +37,20 @@ fi
 # 0. 与 e5-usb-watch 互斥（非 -p 的 mkdir 才是真正的原子锁）
 mkdir -p "$LOCKDIR" 2>/dev/null
 if ! mkdir "$LOCK" 2>/dev/null; then
-	echo "另一个 USB reset 正在进行（$LOCK 存在），本次跳过"
-	exit 1
+	# 陈旧锁：上次被 kill -9 或断电时 trap 没来得及跑，锁会永久留下，
+	# 之后本工具与 S99 自检都会一直跳过恢复。超过 5 分钟就当无效清掉。
+	_now=$(date +%s)
+	_m=$(stat -c %Y "$LOCK" 2>/dev/null) || _m=0
+	case "$_m" in ''|*[!0-9]*) _m=0 ;; esac
+	if [ "$_m" -gt 0 ] && [ $((_now - _m)) -gt 300 ]; then
+		_age=$((_now - _m))
+		rmdir "$LOCK" 2>/dev/null
+		mkdir "$LOCK" 2>/dev/null || { echo "锁仍有争用，本次跳过"; exit 1; }
+		echo "已清理陈旧锁（${_age}s 前遗留）"
+	else
+		echo "另一个 USB reset 正在进行（$LOCK 存在），本次跳过"
+		exit 1
+	fi
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' 0
 

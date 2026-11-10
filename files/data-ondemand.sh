@@ -25,7 +25,9 @@ DIALED=0                     # 本轮是否真的拨了号（用于强制补发�
 
 is_up() { [ "$(cat /sys/class/net/$IFACE/operstate 2>/dev/null)" = up ]; }
 
-qlen() { ls -A "$QUEUE" 2>/dev/null | wc -l | tr -d ' '; }
+# 待发条数：必须排除点开头的隐藏文件 —— 转发补丁写队列时用 .<id>.tmp 临时名，
+# `ls -A` 会把写到一半的临时文件算进队列，导致队列空着也反复拨号。
+qlen() { ls -1 "$QUEUE" 2>/dev/null | wc -l | tr -d ' '; }
 
 # 队列里最早一条排了多久。短信本身在断网时进队，那段时间的退避没有意义，
 # 记下来是为了事后能算清"从短信进队到真正发出"到底花了多少秒。

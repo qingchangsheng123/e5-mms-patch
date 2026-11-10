@@ -1,0 +1,10 @@
+{
+	"id": "forward",
+	"api_version": 2,
+	"version": "1.0",
+	"name": { "zh": "短信转发", "en": "SMS forward" },
+	"description": { "zh": "开关、目标、队列与投递记录", "en": "State, target, queue and deliveries" },
+	"entry": "index.html",
+	"order": 20,
+	"settings": []
+}

@@ -19,6 +19,12 @@ chmod 755 "$OUT/$NAME/files/e5-mms.init"
 chmod 755 "$OUT/$NAME/files/e5-deepsleep" "$OUT/$NAME/files/e5-deepsleep.init"
 chmod 755 "$OUT/$NAME/files/e5-usb-recover" "$OUT/$NAME/files/e5-usb-guard-check" \
          "$OUT/$NAME/files/e5-usb-guard.init"
+chmod 755 "$OUT/$NAME/files/sms-sync/"*.sh "$OUT/$NAME/files/sms-sync/"*.init \
+         "$OUT/$NAME/files/sms-sync/sms-sync.py"
+chmod 755 "$OUT/$NAME/files/modem-guard/e5-modem-guard" \
+         "$OUT/$NAME/files/modem-guard/e5-modem-guard.init" \
+         "$OUT/$NAME/files/modem-guard/install.sh"
+chmod 644 "$OUT/$NAME/files/modem-guard/modem-guard.conf"
 
 tar -czf "$OUT/$NAME.tar.gz" -C "$OUT" "$NAME"
 (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")

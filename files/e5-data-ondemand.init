@@ -15,8 +15,11 @@ start_service() {
 }
 
 stop_service() {
-	# 停止时把数据恢复成连接，避免留下"无数据"状态让人困惑。
-	# 注意要删掉 hold 标记：up 会创建它，否则下次 start 后数据永远不会自动挂断。
-	[ -x /etc/e5/power/data-ondemand.sh ] && /bin/sh /etc/e5/power/data-ondemand.sh up >/dev/null 2>&1
+	# 停服务要把数据恢复到「断开」的省电状态：先清手动保持标记，再挂断。
+	# v1.0.8 及以前这里调的是 up（拨号），语义反了：stop && disable 会把 PDP
+	# 拨起来，而守护已经停了，再没有人来挂断，整机回到 600-900mW 常连态。
+	# 短信走信令通道，与 PDP 无关，断开不影响收发。
 	rm -f /tmp/.e5-do.hold
+	[ -x /etc/e5/power/data-ondemand.sh ] && /bin/sh /etc/e5/power/data-ondemand.sh down >/dev/null 2>&1
+	return 0
 }

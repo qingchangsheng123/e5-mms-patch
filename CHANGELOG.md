@@ -3,6 +3,147 @@
 最终版本，从一台实机（E5 / UMS9621 / `6.18.54-e5-sleep16`）的部署中逐步修正而来。
 早期迭代号（1.0.0 / 1.0.1 / 1.0.2）已从仓库撤销，其修复内容都并入本版本，不再单独发布。
 
+## 1.0.10 — 2026-11-10
+
+信息屏一轮审查（10:20–10:27）后修掉 4 项显示/噪音缺陷，并把「短信转发」做成屏上
+可用的面板。核心链路（收短信 → 解码 → webhook → 退避重试）未改动。
+
+### 修复：熄屏久了，亮屏那一瞬间信号格是空的
+
+- `t551m-sim-status` 熄屏时 `INTERVAL_DARK=60`（省电，不每 5 s 敲基带），而
+  `api.uc` 的 `sim_status()` 只认 15 s 内的快照，超时就返回空 `signal`；
+- `card_modem()` 里 `quality` 又被硬编码成 `null`（防止借副卡的信号），前端两条
+  兜底同时失效，于是亮屏后必然 0 格 + 制式 `--`，直到下一次采样（≤5 s）才恢复。
+- 改为：过期快照保留最后已知的 `present/registration/tech/signal`，只标
+  `stale: true`；`app.js` 用最后一次 `rsrp` 折算格数并把信号格降到 55% 透明度，
+  `rsrp` 缺失才回落 `m.quality`。**零额外功耗**（不加快采样）。
+- 注入验证：把 `/run/t551m-sims.json` 的时间戳改到 120 s 前，`/api/status` 仍返回
+  `rsrp=-95 / quality=62.5 / stale=true`，不再是空对象。
+
+### 修复：8089 通道从来没部署过，却每 3 秒重连一次
+
+- `transport.js` 连 `ws://127.0.0.1:8089/rpc`、`calls.js` 连 `:8089/events`，实际只有
+  8088 的 API 实例在监听；原生 `fetch` 一直兜着，所以功能不坏，代价是 console 每
+  3–4 s 一条 `CONNECTION REFUSED`（实测 17 秒内 6 条）。
+- `transport.js` 改为原生 fetch 直通（该 shim 已无存在意义）；`calls.js` 的 SSE 首次
+  失败就 `close()`，交给已有轮询兜底。重启后同一 session 不再出现 8089 错误。
+
+### 新增：信息屏「应用 → 短信转发」面板
+
+原来屏上能看到短信收发，看不到「转发到哪、有没有发出去、失败后有没有重试」。
+新增 `forward` 插件（`/etc/e5-infoscreen/plugins/forward`，`plugin link` 挂到 web root）：
+
+- 状态：开关、目标主机（**只给 host**，不下发带 token 的 `webhook_body`）、队列
+  `pending/limit`、最近 5 条投递（读 `delivery.log`，把 `invalid_destination` 之类
+  内部代号翻成中文）；
+- 操作：开关（`POST /toggle`）、测试发送（`test-start`）、重试队列（`queue-retry` 放后台）；
+- 写配置走 `e5-forward set`，但它**是全量覆盖**，所以后端先 `get` 再把 22 个字段
+  展平回传，`smtp_password` / `dingtalk_secret` 不回传（脚本缺省时保留原值）。
+  实测回写后 `config.json` 全字段一致、`webhook_body` 长度不变。
+
+### 顺带
+
+- 热点省电插件的 `mode` 默认值由 `radio`（关蜂窝，短信一起断）改为 `data`（只断数据），
+  `backend.uc` 的兜底默认值同步；已配置过的设备不受影响。
+- `patch-screen.py` 幂等：按 marker 跳过已打过的文件，锚点对不上（原厂换版）就原样
+  不动并打印原因；`--revert` 从 `/root/e5-backup/screen` 恢复。
+
+### 实测：v1.0.10 生产配置 4.90 h，21.44 mA
+
+拔线 12:04:45–16:58:40（`DUR=17100 STEP=120`），静默窗口内跑完整生产配置：
+`cc_mah -295 → -400` = 105 mAh → **21.44 mA / 82.6 mW**，燃料计 84.7%→81.0% 交叉印证；
+占空比 98.8%、63 轮、醒 218.8 s、挂起失败 0。同窗 11-09（v1.0.8）为 22.85 mA / 90.3 mW，
+本版低 6.2%。盯的就是 v1.0.9 新增的两个唤醒源（`modem-guard` 180 s、`sms-sync` cron 2 min）：
+**没有抬高均值** —— 醒着的时间反而从 639 s 降到 219 s，唤醒标记 38/39 是 CP 的
+`pscp-5:smsg-5-6+N`，与看门狗、cron 无关；`modem-guard.log` 全程 0 字节（零恢复动作）。
+顺带在窗口内收到真短信一条：首投 `invalid_destination`，14 s 后第 2 次尝试补发成功。
+
+## 1.0.9 — 2026-11-10
+
+全项目静态审查（11-09 21:55）确认的 9 项 A 级缺陷集中修复，并补上过夜实测数据。
+运行时行为只有一处对外可见变化：**全新安装现在真的会装上双系统短信同步**。
+
+### 修复：基带停在 CFUN=0 时没人管，短信全丢
+
+2026-11-10 08:35 实测：`AT+CFUN?` 回 `+CFUN: 0`、`AT+CSQ` 回 `0,99`、`AT+CREG?` 未注册，
+而 `mmcli` 仍报 `state=connected / reg=home / 中国移动 / 5GNR` —— **ModemManager 的
+`registration-state` 是缓存值，会骗过任何只看它的判断**。表现就是短信一条都进不来，
+而转发链路（收 → 解码 → webhook → 退避重试）完全正常。恢复射频后 1 分钟内历史短信即
+进箱并投递成功。
+
+设备上本来就有 `/etc/e5/modem-guard` 这套看门狗，代码注释里甚至写了这个已知故障，
+但 `/etc/init.d` 没有链接、`/etc/rc.d` 没有启动项、进程不存在，日志停在 11-06，等于没有。
+
+- 新增 `files/modem-guard/` 四件，`install.sh` 铺到 `/etc/e5/modem-guard`，由 S19 自愈链装回；
+- 在 `judge()` 之外每轮先做一次 **AT 层射频校验**（`AT+CFUN?`），拿到非 1 直接恢复，
+  不再依赖 ModemManager 的注册状态；
+- `rf_restore()` 分级处理：`AT+CFUN=1` → MM 丢对象则重启 MM → `state=disabled` 则
+  `mmcli --enable` → bearer 掉了补一次 `ifup wan`；
+- `INTERVAL` 60 → 180 s（每轮多一条 AT，60 s 会把深睡窗口切碎）、`HEARTBEAT=0`，
+  并修掉「配置写 `HEARTBEAT=0` 但实现仍每轮写心跳」的缺陷。
+- 实测（注入 `AT+CFUN=0`）：看门狗在下一轮检测到射频关闭并自行恢复，无需人工介入。
+
+### 修复：sms-sync 的 cron 没有重叠保护
+
+`*/2` 每两分钟起一次 `sms-sync.py run`，单次若因 Android 侧卡住超过 2 分钟，crond 会持续
+报 `process already running`。cron 行加 `flock -n /tmp/sms-sync.lock`，重叠时新实例直接退出，
+不再堆积。
+
+### 修复：发布包不含 sms-sync 四件（最严重）
+
+`install.sh` 与 `files/` 里从来没有 `sms-sync`，只有 `install-core.sh` 的扩展循环会去
+`/etc/e5/sms-sync` 找 `install.sh`，而该目录仅在本机手工部署过。结果是 README、CHANGELOG、
+GitHub About 与 release 正文都在宣传「双系统短信互通」，全新安装（含在线一条命令）却拿不到。
+
+- 新增 `files/sms-sync/`：`sms-sync.py` / `install.sh` / `e5-sms-sync.init` / `uninstall.sh`；
+- `install.sh` 部署到 `/etc/e5/sms-sync`，由 S19 自愈链执行它的 `install.sh`；
+- `package.sh` 补上子目录的可执行权限。
+
+### 修复：按需数据 stop 的语义反了
+
+`e5-data-ondemand.init` 的 `stop_service` 调的是 `data-ondemand.sh up` —— 停服务反而拨号，
+且守护已停、再没人挂断，`stop && disable` 之后整机回到 600-900 mW 常连态。
+改为清 `hold` 标记 + `down` 挂断。短信走信令通道，与 PDP 无关，断开不影响收发。
+
+### 修复：卸载回滚不完整
+
+原来只还原解码器/转发器、停 `e5-mms` / `usb-guard` / `deepsleep`；`e5-data-ondemand`、
+`e5-powersave`、`e5-sms-sync` 的自启与 cron 都留着，`powersave.sh on` 删掉的 rc.d 链接
+与 uci 也没人恢复。现按顺序补齐：先 `powersave.sh off` 恢复热点/蓝牙/音频，再撤 sms-sync
+的 cron 与服务，最后停按需数据并挂断。
+
+### 修复：USB 自检不该用 ping 判数据面
+
+设备与主机同在 `192.168.9.0/24` 时内核会经 wlan 选路，ping 通只证明 WiFi 通 —— 恰恰掩盖
+USB 数据面已死，与项目铁律「同网段 ping 是假象」冲突。`e5-usb-guard-check` 改读
+`usb0/statistics/rx_packets` 增量：6 s 不动就主动发一次探测，仍不动才软件拔插。
+`e5-usb-recover` 的 mkdir 锁加 5 分钟陈旧清理（原来被 `kill -9` 后锁永久残留，
+自检会一直跳过恢复）。
+
+### 修复：队列 ID 同秒冲突与隐藏临时文件
+
+`patch-forward.py` 用 `$(date +%s).$$` 做队列 ID，同一秒两条短信（双卡并发、运营商补发）
+会撞名，后一条覆盖前一条 → 直接丢消息。改为撞名递增序号。重写队列条目时用的
+`<id>.tmp.<pid>` 是非隐藏名，会被其他进程的 glob 当成待发消息读到半截，改成隐藏名。
+`data-ondemand.sh` 的 `qlen` 原来用 `ls -A`，把隐藏临时文件算进队列，导致队列空着也反复
+拨号，改为 `ls -1`。
+
+### 修复：发布与备份脚本
+
+- `release_final.py`：同名资产存在时原来直接 `continue`，重打包会留下旧包而正文 sha256
+  是新包的。改为先删旧资产再上传。
+- `backup-e5.sh`：md5 清单补 `e5-deepsleep` / `e5-usb-*` / `pm-test.sh` / `sms-sync.py`；
+  rc.d 过滤补 `deepsleep` / `usb-guard` / `sms-sync`；输出从 `/tmp`（tmpfs，重启即失）
+  改到 `/root/e5-backup`。
+- `publish.py`（依赖已不存在的 `CODEBUDDY_MCP_CONFIG`、仓库路径写错）移到 `_legacy/`。
+
+### 修订：README 功耗口径与 #8 说明
+
+「41 mA / 167 mW，待过夜复核」换成实测：白天 22.85 mA / 90.3 mW（5.6 天）、
+夜间 39.07 mA / 151.8 mW（3.3 天），并说明 21:30 的转折与 CP `smsg` 停止同轮次。
+`time.sleep(0.5)` 被拉长到 3 s 的旧疑问也解释清楚了：挂起期间 `CLOCK_MONOTONIC` 不走，
+与 v5 采样修复是同一个根因，不是 AP 调度问题。
+
 ## 1.0.8 — 2026-11-09
 
 纯闭环版本，核心逻辑（彩信解码、转发重试、深睡守护）一行未改。

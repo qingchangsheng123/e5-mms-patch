@@ -1,0 +1,291 @@
+#!/bin/sh
+# e5-modem-guard -- 基站注册看门狗
+#
+# 背景：E5 的 AT 通道只有一个属主（ModemManager，端口 wwan0at0）。一旦 MM
+# 卡在一条 AT 命令上，或者基带复位后 MM 没重新探测到 modem 对象，表现就是
+# "信号格归零 + 收不到短信"，而且不会自己好，只能重启系统。
+#
+# 本脚本每 INTERVAL 秒读一次 MM 的注册状态；异常持续到阈值后按阶梯恢复：
+#   1) 重启 ModemManager        （实测约 85~90 秒重新驻网）
+#   2) AT+CFUN=1,1 软复位基带
+#   3) 重启整个 modem 栈（t551m-at / e5-modemd / ModemManager）
+# 恢复前先抓一份现场（MM 状态、进程、AT 交叉验证、dmesg）写进日志。
+#
+# 用法：
+#   e5-modem-guard status    # 打印一次当前状态
+#   e5-modem-guard run       # 常驻（由 /etc/init.d/e5-modem-guard 拉起）
+#   e5-modem-guard recover   # 手动执行一次恢复阶梯
+
+CONF=/etc/e5/modem-guard.conf
+[ -f "$CONF" ] && . "$CONF"
+: "${INTERVAL:=60}"
+: "${BAD_LIMIT:=3}"
+: "${SEARCH_LIMIT:=10}"
+: "${ENABLE_RECOVER:=1}"
+: "${ENABLE_REBOOT:=0}"
+: "${REBOOT_MINUTES:=20}"
+: "${HEARTBEAT:=5}"
+: "${STARTUP_GRACE:=180}"
+
+LOG=/etc/e5/modem-guard.log
+BADF=/tmp/.e5-modem-guard.bad
+LOCK=/tmp/.e5-modem-guard.lock
+MAXLOG=131072
+
+log() {
+	echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"
+	sz=$(wc -c <"$LOG" 2>/dev/null || echo 0)
+	[ "$sz" -gt "$MAXLOG" ] && mv -f "$LOG" "$LOG.1"
+	echo "$*"
+}
+
+# 读一次 MM 状态，填 STATE / REG / PS / SQ / REC / SIM / MMOK
+probe() {
+	STATE=; REG=; PS=; SQ=; REC=; SIM=; MMOK=0
+	out=$(timeout 15 mmcli -m any -K --timeout=8 2>/dev/null) || return 0
+	[ -n "$out" ] || return 0
+	MMOK=1
+	STATE=$(printf '%s\n' "$out" | sed -n 's/^modem\.generic\.state[[:space:]]*:[[:space:]]*//p')
+	SQ=$(printf '%s\n' "$out" | sed -n 's/^modem\.generic\.signal-quality\.value[[:space:]]*:[[:space:]]*//p')
+	REC=$(printf '%s\n' "$out" | sed -n 's/^modem\.generic\.signal-quality\.recent[[:space:]]*:[[:space:]]*//p')
+	SIM=$(printf '%s\n' "$out" | sed -n 's/^modem\.generic\.sim[[:space:]]*:[[:space:]]*//p')
+	REG=$(printf '%s\n' "$out" | sed -n 's/^modem\.3gpp\.registration-state[[:space:]]*:[[:space:]]*//p')
+	PS=$(printf '%s\n' "$out" | sed -n 's/^modem\.3gpp\.packet-service-state[[:space:]]*:[[:space:]]*//p')
+	return 0
+}
+
+# 0 = 正常，1 = 卡死/异常，2 = 不适用（没 SIM），3 = 正在搜网
+judge() {
+	[ "$MMOK" = 0 ] && return 1
+	[ -z "$STATE" ] && return 1
+	case "$SIM" in ""|"--"|"/") return 2 ;; esac
+	case "$STATE" in failed|disabled) return 1 ;; esac
+	case "$REG" in home|roaming) return 0 ;; esac
+	case "$STATE" in searching|enabling|connecting|registered) return 3 ;; esac
+	return 1
+}
+
+desc() {
+	echo "mm=$MMOK state=${STATE:--} reg=${REG:--} ps=${PS:--} sq=${SQ:--} rec=${REC:--}"
+}
+
+evidence() {
+	{
+		echo "---- $(date '+%F %T') 现场 ----"
+		echo "[mmcli -K]"
+		mmcli -m any -K --timeout=8 2>&1 | head -50
+		echo "[进程]"
+		ps w 2>/dev/null | grep -E 'ModemManager|e5-modemd|t551m-atd|modem_control' | grep -v grep
+		echo "[AT 交叉验证]"
+		printf 'AT+CEREG? -> '; timeout 15 e5-at -t 10 "AT+CEREG?" 2>&1 | tr '\n' ' '; echo
+		printf 'AT+CSQ    -> '; timeout 15 e5-at -t 10 "AT+CSQ" 2>&1 | tr '\n' ' '; echo
+		printf 'sipc card -> '; cat /sys/module/sipc_wwan/parameters/card 2>/dev/null
+		echo "[dmesg]"
+		dmesg 2>/dev/null | grep -viE 'sipa_dele|smsg|Audio:SIPC|sprd-wlan|charger-manager|sprd-fgu' | tail -15
+		echo "[logread]"
+		logread 2>/dev/null | grep -viE 'sipa_dele|smsg|sprd-wlan' | tail -15
+		echo "---- 现场结束 ----"
+	} >>"$LOG" 2>&1
+}
+
+# 等待恢复，$1 = 最多等多少秒；返回 0 表示已注册
+wait_ok() {
+	n=$1
+	while [ "$n" -gt 0 ]; do
+		sleep 10
+		n=$((n - 10))
+		probe
+		judge
+		[ $? -eq 0 ] && return 0
+	done
+	return 1
+}
+
+# AT+CFUN=1,1 之后基带有可能停在 CFUN=0（射频关闭）。这时 ModemManager 会把 modem
+# 对象整个丢掉（mmcli -L 空），再怎么重启服务都没用，必须显式把射频打开。
+ensure_rf() {
+	cf=$(timeout 20 e5-at -t 15 "AT+CFUN?" 2>/dev/null | tr -d '\r' |
+		sed -n 's/^+CFUN: *\([0-9]*\).*/\1/p' | head -1)
+	case "$cf" in
+	"" | 1) return 0 ;;	# 读不到就交给后面的正常流程，1 表示已经开着
+	esac
+	log "射频处于 CFUN=$cf（关闭状态），执行 AT+CFUN=1"
+	timeout 25 e5-at -t 15 "AT+CFUN=1" >>"$LOG" 2>&1
+	sleep 8
+}
+
+# ModemManager 的 registration-state 是缓存值。2026-11-10 实测出现过
+# mmcli 报 state=connected / reg=home / 运营商正确，AT 层却是 CFUN=0 +
+# CSQ=0 + CREG 未注册：短信一条都收不到，而 judge() 会判"正常"永不介入。
+# 所以每轮直接问基带射频档位，拿到非 1 就当作异常单点处理。
+# 返回 0 = 射频确实关着（RF_CFUN 里是读到的档位），1 = 正常或读不到。
+rf_off() {
+	RF_CFUN=$(timeout 20 e5-at -t 15 "AT+CFUN?" 2>/dev/null | tr -d '\r' |
+		sed -n 's/^+CFUN: *\([0-9]*\).*/\1/p' | head -1)
+	case "$RF_CFUN" in
+	"" | 1) return 1 ;;
+	esac
+	return 0
+}
+
+# 不开三级恢复，只把射频打开：CFUN=0 时重启 ModemManager 是无效功。
+# 但 2026-11-10 两次注入实测证明 CFUN=1 只解决一半，MM 侧还会停在三种状态：
+#   disabled —— 必须 mmcli --enable，重启 MM 不解除
+#   failed   —— 必须重启 MM，mmcli --enable 无效
+#   丢对象   —— mmcli -L 空，必须重启 MM
+# 射频重开还会让 bearer 失效，netifd 不一定自己重拨，最后补一次 ifup。
+rf_restore() {
+	log "射频被关（CFUN=$RF_CFUN），执行 AT+CFUN=1"
+	timeout 25 e5-at -t 15 "AT+CFUN=1" >>"$LOG" 2>&1
+	sleep 10
+	probe
+	if [ "$STATE" = disabled ]; then
+		log "modem 处于 disabled，执行 mmcli --enable"
+		timeout 20 mmcli -m any --enable >>"$LOG" 2>&1
+		sleep 8
+		probe
+	fi
+	case "$STATE" in
+	"" | failed)
+		log "ModemManager 侧状态异常（${STATE:-丢对象}），重启 ModemManager"
+		/etc/init.d/modemmanager restart >/dev/null 2>&1
+		n=60
+		while [ "$n" -gt 0 ]; do
+			sleep 10; n=$((n - 10))
+			probe
+			[ "$MMOK" = 1 ] && [ -n "$STATE" ] && break
+		done
+		if [ "$STATE" = disabled ]; then
+			log "modem 处于 disabled，执行 mmcli --enable"
+			timeout 20 mmcli -m any --enable >>"$LOG" 2>&1
+			sleep 8
+			probe
+		fi
+		;;
+	esac
+	# 射频重开后 bearer 往往已掉，netifd 有时不自己重拨，补一次 ifup
+	ip -4 addr show sipa_eth0 2>/dev/null | grep -q 'inet ' || ifup wan >/dev/null 2>&1
+	log "射频已开启，当前：$(desc)"
+}
+
+recover() {
+	log "== 开始恢复：$(desc) =="
+	evidence
+
+	log "步骤1/3：重启 ModemManager"
+	/etc/init.d/modemmanager restart >/dev/null 2>&1
+	if wait_ok 120; then log "恢复成功（重启 MM）：$(desc)"; return 0; fi
+
+	log "步骤2/3：AT 软复位基带 AT+CFUN=1,1"
+	e5-at -t 20 "AT+CFUN=1,1" >>"$LOG" 2>&1
+	sleep 15
+	ensure_rf
+	if wait_ok 120; then log "恢复成功（CFUN=1,1）：$(desc)"; return 0; fi
+
+	log "步骤3/3：重启整个 modem 栈（t551m-at / e5-modemd / ModemManager）"
+	/etc/init.d/t551m-at restart >/dev/null 2>&1
+	/etc/init.d/e5-modemd restart >/dev/null 2>&1
+	sleep 3
+	/etc/init.d/modemmanager restart >/dev/null 2>&1
+	sleep 10
+	ensure_rf
+	if wait_ok 120; then log "恢复成功（整栈重启）：$(desc)"; return 0; fi
+
+	log "!! 三级恢复全部失败：$(desc)"
+	return 1
+}
+
+cmd_status() {
+	probe
+	echo "$(desc)"
+	judge
+	case $? in
+		0) echo "判定：正常" ;;
+		2) echo "判定：无 SIM 卡 / 不适用，看门狗不介入" ;;
+		3) echo "判定：未注册（正在搜网/使能），已连续 $(cat "$BADF" 2>/dev/null || echo 0) 次" ;;
+		*) echo "判定：异常（已连续 $(cat "$BADF" 2>/dev/null || echo 0) 次）" ;;
+	esac
+}
+
+cmd_run() {
+	hb=0
+	if [ "$HEARTBEAT" -gt 0 ]; then
+		hb=$((HEARTBEAT * 60 / INTERVAL)); [ "$hb" -gt 0 ] || hb=1
+	fi
+	log "看门狗启动：$(uname -r) / uptime $(awk '{print int($1/60)}' /proc/uptime) 分钟；每 ${INTERVAL}s 检查（含 AT 射频校验），卡死 ${BAD_LIMIT} 次、搜网 ${SEARCH_LIMIT} 次后恢复"
+	# 开机后 MM 要 60~90 秒才探测到 modem 对象，先等一会儿再开始计异常
+	sleep "$STARTUP_GRACE"
+	probe
+	log "监视中：$(desc)"
+	i=0
+	while :; do
+		i=$((i + 1))
+		probe
+		# 射频档位优先于 MM 的注册状态：MM 报 home 但 CFUN=0 时短信收不到。
+		if rf_off; then
+			rf_restore
+			echo 0 >"$BADF"
+			if [ "$hb" -gt 0 ] && [ $((i % hb)) -eq 0 ]; then
+				log "心跳：$(desc)"
+			fi
+			sleep "$INTERVAL"
+			continue
+		fi
+		judge
+		rc=$?
+		bad=$(cat "$BADF" 2>/dev/null || echo 0)
+		limit=
+		case $rc in
+			0)
+				[ "$bad" -gt 0 ] && log "已恢复：$(desc)"
+				echo 0 >"$BADF"
+				;;
+			2)
+				[ "$bad" -gt 0 ] && log "无 SIM 卡，暂停监视"
+				echo 0 >"$BADF"
+				;;
+			3)
+				bad=$((bad + 1))
+				echo "$bad" >"$BADF"
+				if [ "$bad" -eq 1 ] || [ "$bad" -ge "$SEARCH_LIMIT" ]; then
+					log "未注册（搜网中）${bad}/${SEARCH_LIMIT}：$(desc)"
+				fi
+				limit=$SEARCH_LIMIT
+				;;
+			*)
+				bad=$((bad + 1))
+				echo "$bad" >"$BADF"
+				log "异常 ${bad}/${BAD_LIMIT}：$(desc)"
+				limit=$BAD_LIMIT
+				;;
+		esac
+		if [ -n "$limit" ] && [ "$bad" -ge "$limit" ]; then
+			if mkdir "$LOCK" 2>/dev/null; then
+				if [ "$ENABLE_RECOVER" = 1 ]; then
+					if ! recover; then
+						if [ "$ENABLE_REBOOT" = 1 ] && [ "$bad" -ge "$((REBOOT_MINUTES * 60 / INTERVAL + 1))" ]; then
+							log "!! 超过 ${REBOOT_MINUTES} 分钟无服务，重启系统"
+							sync
+							reboot
+						fi
+					fi
+				else
+					log "异常但未启用自动恢复：$(desc)"
+				fi
+				rmdir "$LOCK" 2>/dev/null
+				echo 0 >"$BADF"
+			fi
+		fi
+		if [ "$hb" -gt 0 ] && [ $((i % hb)) -eq 0 ]; then
+			log "心跳：$(desc)"
+		fi
+		sleep "$INTERVAL"
+	done
+}
+
+case "$1" in
+	status) cmd_status ;;
+	recover) probe; recover ;;
+	run) cmd_run ;;
+	*) echo "用法: $0 {status|run|recover}" >&2; exit 2 ;;
+esac
